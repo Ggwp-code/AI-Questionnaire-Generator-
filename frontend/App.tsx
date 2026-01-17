@@ -43,8 +43,14 @@ const App: React.FC = () => {
       {/* HEADER */}
       <header className="fixed top-0 inset-x-0 z-50 px-6 py-6 pointer-events-none">
         <div className="max-w-6xl mx-auto flex items-center justify-between pointer-events-auto">
-          <div className="flex items-center space-x-2 bg-white/50 backdrop-blur-md px-5 py-2.5 rounded-full border border-white/60 shadow-sm">
-            <span className="font-display font-bold text-lg tracking-tight text-accent">Tribunal</span>
+          <div className="group relative flex items-center space-x-2 bg-white/50 backdrop-blur-md px-5 py-2.5 rounded-full border border-white/60 shadow-sm hover:shadow-xl hover:shadow-accent/20 hover:border-accent/40 hover:bg-white/80 transition-all duration-500 cursor-pointer overflow-hidden">
+            {/* Animated background gradient on hover */}
+            <div className="absolute inset-0 bg-gradient-to-r from-accent/0 via-accent/5 to-accent/0 opacity-0 group-hover:opacity-100 transition-opacity duration-500 animate-pulse"></div>
+
+            <span className="relative font-display font-bold text-lg tracking-tight text-accent group-hover:scale-110 group-hover:text-accent-hover inline-block transition-all duration-500 group-hover:rotate-[-2deg] drop-shadow-sm group-hover:drop-shadow-lg">
+              Tribunal
+            </span>
+            <span className="relative text-xl group-hover:text-accent transition-all duration-500 opacity-0 group-hover:opacity-100 transform translate-x-[-10px] group-hover:translate-x-0 group-hover:rotate-12 group-hover:scale-110">⚖️</span>
           </div>
 
           <nav className="flex space-x-1 bg-white/50 backdrop-blur-md p-1.5 rounded-full border border-white/60 shadow-sm">
