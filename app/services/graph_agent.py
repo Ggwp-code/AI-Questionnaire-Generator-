@@ -1,1 +1,1776 @@
+"""
+Module: app/services/graph_agent.py
+Purpose: Multi-Agent Exam Engine.
+"""
 
+import os
+import warnings
+# Silence all the noise
+warnings.filterwarnings("ignore")
+
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file
+
+from typing import TypedDict, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from pydantic import BaseModel, Field
+
+from app.tools.calculator import get_math_tool
+from app.tools.web_search import get_search_tool
+from app.services.rag_service import get_rag_service
+from app.core.question_bank import get_existing_template, save_template, check_duplicate, find_similar_questions
+from app.tools.utils import get_logger
+from app.services.metrics import get_metrics, timed_node, track_generation
+from app.config import get_format_instruction, get_tags, get_prompt_loader
+
+logger = get_logger("Tribunal_Engine")
+
+# --- TOPIC TYPE DETECTION (Context-Based) ---
+
+def analyze_topic_type(topic: str, context: str) -> bool:
+    """
+    Analyze PDF context and determine if topic is computational or conceptual.
+    Returns True if conceptual (no code needed), False if computational (needs code).
+
+    Priority:
+    1. Explicit user preference in topic text (highest priority)
+    2. Context-based analysis
+    3. Default to computational if ambiguous
+    """
+    topic_lower = topic.lower()
+
+    # 1. Check for EXPLICIT user preference in topic text
+    # User wants conceptual/theory question
+    conceptual_keywords = ['conceptual', 'theory', 'theoretical', 'explain', 'define', 'describe', 'what is', 'types of']
+    for kw in conceptual_keywords:
+        if kw in topic_lower:
+            logger.info(f"Topic '{topic}' explicitly requests CONCEPTUAL question (found '{kw}')")
+            return True
+
+    # User wants numerical/computational question
+    numerical_keywords = ['numerical', 'calculate', 'compute', 'solve', 'find the', 'determine']
+    for kw in numerical_keywords:
+        if kw in topic_lower:
+            logger.info(f"Topic '{topic}' explicitly requests COMPUTATIONAL question (found '{kw}')")
+            return False
+
+    # 2. Context-based analysis (if no explicit preference)
+    context_lower = context.lower()
+
+    # Check for computational signals in context
+    computational_signals = [
+        'formula', '=', 'calculate', 'compute', 'entropy(', 'gini(',
+        'probability', 'p(', 'log2', 'sum of', '∑', 'σ', 'μ',
+        '|', 'given', 'likelihood', 'accuracy', 'precision', 'recall'
+    ]
+    signal_count = sum(1 for signal in computational_signals if signal in context_lower)
+
+    # Check for conceptual signals
+    conceptual_signals = [
+        'definition', 'defined as', 'refers to', 'is a', 'are called',
+        'types of', 'categories', 'properties', 'characteristics',
+        'advantage', 'disadvantage', 'comparison', 'difference between'
+    ]
+    concept_count = sum(1 for signal in conceptual_signals if signal in context_lower)
+
+    # Only mark as conceptual if CLEARLY conceptual (more concept signals than computational)
+    if concept_count >= 3 and signal_count < 2:
+        logger.info(f"Topic '{topic}' detected as CONCEPTUAL (concept={concept_count}, compute={signal_count})")
+        return True
+
+    # 3. Default to computational - code verification is more reliable
+    logger.info(f"Topic '{topic}' defaulting to COMPUTATIONAL (concept={concept_count}, compute={signal_count})")
+    return False
+
+# --- CONFIGURATION ---
+
+# LLM Instance Cache - avoids creating new instances for every call
+_llm_cache: Dict[str, any] = {}
+
+def get_llm(json_mode=False, mode="auto"):
+    """Get cached LLM instance. Creates once, reuses thereafter."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key: raise ValueError("OPENAI_API_KEY missing")
+
+    # Create cache key from configuration
+    schema_name = json_mode.__name__ if json_mode else "none"
+    cache_key = f"{mode}:{schema_name}"
+
+    if cache_key in _llm_cache:
+        return _llm_cache[cache_key]
+
+    model_map = {"instant": "gpt-5-nano", "auto": "gpt-5-mini", "thinking": "gpt-5-mini"}
+    selected = model_map.get(mode, "gpt-5-mini")
+
+    # GPT-5 models only support temperature=1 (must be explicit, default is 0.7)
+    llm = ChatOpenAI(
+        model=selected,
+        api_key=api_key,
+        temperature=1,
+        request_timeout=120
+    )
+
+    result = llm.with_structured_output(json_mode) if json_mode else llm
+    _llm_cache[cache_key] = result
+    logger.debug(f"[LLM Cache] Created new instance for {cache_key}")
+    return result
+
+def get_fallback_llm(json_mode=False):
+    """Get cached fallback LLM instance."""
+    return get_llm(json_mode=json_mode, mode="auto")
+
+def clear_llm_cache():
+    """Clear the LLM cache (useful for testing or config changes)."""
+    global _llm_cache
+    _llm_cache = {}
+    logger.info("[LLM Cache] Cleared")
+
+search_tool = get_search_tool()
+math_tool = get_math_tool()
+
+# --- DATA MODELS ---
+
+class CodeDraft(BaseModel):
+    """First pass: Generate only the verification code and dataset"""
+    verification_code: str = Field(description="Python code that PRINTS the answer")
+    dataset_description: str = Field(description="Brief description of the dataset/problem setup")
+
+class QuestionDraft(BaseModel):
+    """Second pass: Generate question based on executed code results"""
+    question: str = Field(description="The exam question text")
+    answer: str = Field(description="The precise answer")
+    explanation: str = Field(description="Reasoning with citations")
+    options: Optional[List[str]] = Field(default=None, description="Options if MCQ")
+    verification_code: Optional[str] = Field(default=None, description="Python code that PRINTS the answer")
+    difficulty_rating: str = Field(description="Self-assessed difficulty")
+
+class CritiqueResult(BaseModel):
+    score: int = Field(description="Quality score out of 10")
+    feedback: str = Field(description="Specific feedback")
+    is_passing: bool = Field(description="True if score >= 8")
+    flaws: List[str] = Field(description="List of identified flaws")
+
+# --- QUESTION TEMPLATES ---
+# Strict templates for each question type to ensure consistent quality
+
+QUESTION_TEMPLATES = {
+    'mcq': """
+**Multiple Choice Question Template:**
+
+[Context/Scenario if needed - 1-2 sentences]
+
+[Clear question statement ending with ?]
+
+A) [First option - complete sentence/answer]
+B) [Second option - complete sentence/answer]
+C) [Third option - complete sentence/answer]
+D) [Fourth option - complete sentence/answer]
+
+CRITICAL: The options A), B), C), D) MUST be included in the question text itself!
+Do NOT just say "Which option is correct?" without providing the options.
+
+**Answer:** [Correct letter only, e.g., "A"]
+**Explanation:** [Why correct answer is right and others are wrong]
+""",
+
+    'short': """
+**Short Answer Question Template:**
+
+[Context/Background - 1-2 sentences if needed]
+
+[Clear, focused question - should be answerable in 2-5 sentences]
+
+**Answer:** [Concise answer - 2-5 sentences]
+**Key Points:** [Bullet points of essential concepts]
+""",
+
+    'numerical': """
+**Numerical Question Template:**
+
+[Problem setup with clear data]
+
+Given the following data:
+| Column1 | Column2 | ... |
+|---------|---------|-----|
+| value1  | value2  | ... |
+
+[Clear question asking for specific calculation]
+
+**Answer:** [Numerical result with units if applicable]
+**Solution Steps:**
+1. [Step 1 calculation]
+2. [Step 2 calculation]
+...
+""",
+
+    'long': """
+**Long Answer Question Template:**
+
+[Context/Scenario - 2-3 sentences]
+
+Answer the following:
+
+(a) [First part - 2-3 marks worth]
+
+(b) [Second part - 2-3 marks worth]
+
+(c) [Third part if applicable]
+
+**Model Answer:**
+(a) [Detailed answer for part a]
+
+(b) [Detailed answer for part b]
+
+(c) [Answer for part c if applicable]
+"""
+}
+
+def refine_question(question_data: Dict, topic: str, difficulty: str, question_type: str = None) -> Dict:
+    """
+    Self-refinement step: Have LLM review and improve the generated question.
+    Returns improved question_data.
+    """
+    if not question_data or 'question' not in question_data:
+        return question_data
+
+    logger.info("[Refinement] Self-reviewing question for quality...")
+
+    q_text = question_data.get('question', '').lower()
+    answer = question_data.get('answer', '').strip().upper()
+
+    # Detect question type from content if not provided
+    if not question_type:
+        # Check if answer suggests MCQ (single letter A-D)
+        if answer in ['A', 'B', 'C', 'D']:
+            question_type = 'mcq'
+        elif any(opt in q_text for opt in ['a)', 'b)', 'c)', 'd)', 'options:']):
+            question_type = 'mcq'
+        elif any(calc in q_text for calc in ['calculate', 'compute', 'find the value', 'determine']):
+            question_type = 'numerical'
+        elif '(a)' in q_text or '(b)' in q_text:
+            question_type = 'long'
+        else:
+            question_type = 'short'
+
+    # CRITICAL FIX: If MCQ but options are missing from question text, force regeneration
+    if question_type == 'mcq':
+        has_options = any(f'{opt})' in q_text for opt in ['a', 'b', 'c', 'd'])
+        if not has_options:
+            logger.warning("[Refinement] MCQ detected but options missing from question_text - will fix")
+
+    template = QUESTION_TEMPLATES.get(question_type, QUESTION_TEMPLATES['short'])
+
+    # Build MCQ-specific instructions if options are missing
+    mcq_fix_instructions = ""
+    if question_type == 'mcq':
+        has_options = any(f'{opt})' in q_text for opt in ['a', 'b', 'c', 'd'])
+        if not has_options:
+            mcq_fix_instructions = f"""
+**CRITICAL MCQ FIX REQUIRED:**
+The answer is "{answer}" but the options A), B), C), D) are NOT in the question text!
+You MUST add the 4 options to the question text based on the explanation provided.
+The explanation mentions: {question_data.get('explanation', '')[:500]}
+
+Generate appropriate options where option {answer} is correct and the others are plausible distractors.
+"""
+
+    refinement_prompt = f"""Review and improve this exam question. Fix any issues with clarity, formatting, or accuracy.
+
+ORIGINAL QUESTION:
+{question_data.get('question', '')}
+
+ORIGINAL ANSWER:
+{question_data.get('answer', '')}
+{mcq_fix_instructions}
+TARGET TEMPLATE FORMAT:
+{template}
+
+REFINEMENT CHECKLIST:
+1. Is the question clear and unambiguous?
+2. Does it match the {difficulty} difficulty level?
+3. Is the formatting clean with proper spacing?
+4. For MCQs: Are all 4 options (A, B, C, D) ON SEPARATE LINES in the question text?
+5. For numerical: Is there a clear data table?
+6. Is the answer complete and accurate?
+
+Return the IMPROVED version following the template format exactly.
+Keep the same core question but improve clarity and formatting."""
+
+    llm = get_llm(json_mode=QuestionDraft, mode="auto")
+
+    try:
+        response = llm.invoke([
+            SystemMessage(content=refinement_prompt),
+            HumanMessage(content="Improve this question.")
+        ])
+        refined = response.model_dump()
+
+        # Preserve original fields that shouldn't change
+        refined['verification_code'] = question_data.get('verification_code')
+        refined['computed_answer'] = question_data.get('computed_answer')
+        refined['question_type'] = question_type or question_data.get('question_type')
+
+        logger.info("[Refinement] Question improved successfully")
+        return refined
+    except Exception as e:
+        logger.warning(f"[Refinement] Failed, using original: {e}")
+        return question_data
+
+# --- STATE ---
+
+class AgentState(TypedDict):
+    topic: str
+    target_difficulty: str
+    question_type: Optional[str]  # 'mcq', 'short', 'long', 'calculation', 'trace', etc.
+    db_template: Optional[Dict]
+    retrieved_context: str
+    source_type: str
+    source_urls: List[str]
+    source_pages: List[int]  # Page numbers from PDF used
+    source_filename: Optional[str]  # PDF filename
+    detected_keywords: Dict[str, str]  # Keywords detected in query -> relevant context
+    code_draft: Optional[Dict]  # First pass: code only
+    computed_result: Optional[str]  # Result from executing code
+    question_data: Dict  # Second pass: full question
+    critique: Optional[Dict]
+    iteration_count: int
+    revision_count: int
+    verification_passed: bool
+    verification_error: Optional[str]
+    answer_mismatch: bool
+    answer_validation_count: int
+    use_fallback: bool
+    is_conceptual: bool  # True if topic is theory-based, skip code generation
+    cached_question: Optional[Dict]  # Cached question from bank (skip generation if set)
+    force_new: bool  # Force new generation even if cache exists
+
+# --- NODES ---
+
+@timed_node("scout")
+def check_sources(state: AgentState) -> Dict:
+    logger.info(f"[Phase 1] Scouting Sources for: {state['topic']}")
+    context_parts = []
+    sources = []
+    all_source_urls = []
+    source_pages = []
+    source_filename = ""
+    detected_keywords = {}
+
+    # Run PDF search and duplicate check in PARALLEL for faster scout
+    rag = get_rag_service()
+    pdf_result = None
+    duplicate_result = None
+
+    def search_pdf():
+        return rag.search_with_keywords(state['topic'], k=10)
+
+    def check_cache():
+        if state['iteration_count'] == 0 and not state.get('force_new', False):
+            return check_duplicate(state['topic'], state['target_difficulty'], threshold=0.8)
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pdf_future = executor.submit(search_pdf)
+        cache_future = executor.submit(check_cache)
+
+        pdf_result = pdf_future.result()
+        duplicate_result = cache_future.result()
+
+    # Unpack PDF results
+    pdf_context, pages, filename, keyword_contexts = pdf_result
+    source_pages = pages
+    source_filename = filename
+    detected_keywords = keyword_contexts
+
+    # Log detected keywords
+    if keyword_contexts:
+        logger.info(f"Detected content keywords: {list(keyword_contexts.keys())}")
+
+    # SAFETY CHECK: If PDF context is too weak, trigger fallback immediately
+    if pdf_context and len(pdf_context) > 200:
+        logger.info(f"PDF context found from {filename}, pages: {pages}")
+        context_parts.append(f"--- AUTHORITATIVE SOURCE: UPLOADED PDF TEXTBOOK ---\n{pdf_context}\n\n--- CRITICAL: Use ONLY the formulas and methods from this PDF. ---")
+        sources.append("pdf")
+    else:
+        logger.error("No PDF context found - Cannot generate without PDF source.")
+        return {
+            'retrieved_context': "",
+            'source_type': "no_source",
+            'source_urls': [],
+            'source_pages': [],
+            'source_filename': None,
+            'detected_keywords': {},
+            'db_template': None,
+            'use_fallback': True
+        }
+
+    # 2. Process duplicate check result
+    cached_question = None
+    if duplicate_result and duplicate_result.get('question_text'):
+        logger.info(f"[CACHE HIT] Found similar question in bank (similarity: {duplicate_result.get('similarity_score', 0):.2f})")
+        cached_question = duplicate_result
+        sources.append("question_bank_cache")
+    elif state['iteration_count'] == 0 and not state.get('force_new', False):
+        # Use existing template for format reference only
+        template = get_existing_template(state['topic'], state['target_difficulty'])
+        if template:
+            logger.info("Found existing template - Using ONLY for format/structure reference")
+            context_parts.append(f"--- FORMAT REFERENCE ---\n{template['question_text']}")
+            sources.append("database_remix")
+
+    logger.info("Web search disabled - Using PDF only for content accuracy")
+
+    full_context = "\n\n".join(context_parts)
+
+    # IMPORTANT: Respect explicit question_type from user (set in run_agent)
+    # Only auto-detect if is_conceptual wasn't explicitly set based on question_type
+    if state.get('is_conceptual') is not None:
+        # User explicitly chose question_type - respect their choice
+        topic_is_conceptual = state.get('is_conceptual')
+        logger.info(f"Using explicit is_conceptual={topic_is_conceptual} from question_type")
+    else:
+        # No explicit choice - analyze topic based on PDF context
+        topic_is_conceptual = analyze_topic_type(state['topic'], full_context)
+
+    return {
+        'retrieved_context': full_context,
+        'source_type': "+".join(sources),
+        'source_urls': all_source_urls,
+        'source_pages': source_pages,
+        'source_filename': source_filename,
+        'detected_keywords': detected_keywords,
+        'db_template': None,
+        'is_conceptual': topic_is_conceptual,
+        'cached_question': cached_question  # Will be used to skip generation if set
+    }
+
+@timed_node("theory_author")
+def generate_theory_question(state: AgentState) -> Dict:
+    """Generate question for CONCEPTUAL topics - no code needed, test understanding directly"""
+    context = state.get('retrieved_context', '')
+    question_type = state.get('question_type', 'short')
+
+    logger.info(f"[Phase 2-THEORY] Generating conceptual/theory question (type={question_type})...")
+
+    # Build format instructions based on question_type
+    if question_type == 'mcq':
+        format_instruction = """
+FORMAT: Multiple Choice Question (MCQ)
+- Present a clear question stem
+- Provide exactly 4 options labeled A), B), C), D)
+- Put each option on a NEW LINE
+- Only ONE option should be correct
+- The answer should be just the letter (e.g., "A")
+"""
+    elif question_type == 'long':
+        format_instruction = """
+FORMAT: Long Answer / Essay Question
+- Create a multi-part question with (a), (b), (c) parts
+- Each part should require a detailed explanation (2-4 sentences minimum)
+- DO NOT use MCQ format - this is an essay/written response question
+- The answer should be a comprehensive written response for each part
+"""
+    elif question_type == 'short':
+        format_instruction = """
+FORMAT: Short Answer Question
+- Create a focused question answerable in 2-5 sentences
+- DO NOT use MCQ format - this requires a written response
+- The answer should be a concise but complete explanation
+"""
+    else:
+        format_instruction = """
+FORMAT: Open-ended Question
+- Create a question appropriate for the topic
+- The answer should be clear and comprehensive
+"""
+
+    system_prompt = f"""You are an expert professor creating an exam question about a CONCEPTUAL topic.
+
+Topic: {state['topic']}
+Difficulty: {state['target_difficulty']}
+
+Reference material from PDF:
+{context[:8000]}
+
+IMPORTANT: This is a CONCEPTUAL/THEORETICAL topic. Create a question that tests:
+- Understanding of definitions and concepts
+- Ability to explain, compare, or analyze ideas
+- Application of theoretical knowledge
+
+{format_instruction}
+
+FORMATTING REQUIREMENTS:
+- Use SHORT paragraphs (2-3 sentences max)
+- Add BLANK LINES between different parts of the question
+- For data/tables, use markdown table format with blank lines before and after
+- For multi-part questions, clearly separate parts with blank lines
+- Be specific and reference concepts from the PDF context
+
+The answer should be based DIRECTLY on the PDF content provided."""
+
+    llm = get_llm(json_mode=QuestionDraft, mode="auto")
+
+    try:
+        type_instruction = f" as a {question_type.upper()} question" if question_type else ""
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Create a {state['target_difficulty']} conceptual question about {state['topic']}{type_instruction}.")
+        ])
+        q_data = response.model_dump()
+        q_data['computed_answer'] = q_data.get('answer', '')  # No code verification for theory
+        q_data['question_type'] = question_type  # Preserve the requested type
+
+        # Self-refinement step
+        q_data = refine_question(q_data, state['topic'], state['target_difficulty'], question_type)
+
+        logger.info("[Phase 2-THEORY] Theory question generation complete")
+        return {'question_data': q_data, 'verification_passed': True}
+    except Exception as e:
+        logger.error(f"Theory question generation failed: {e}")
+        return {'use_fallback': True, 'verification_error': str(e)}
+
+@timed_node("code_author")
+def generate_code_only(state: AgentState) -> Dict:
+    """PHASE 2A: Generate only verification code and dataset (First Pass)"""
+    if state.get('use_fallback') or state.get('is_conceptual'): return {}
+    context = state.get('retrieved_context', '')
+    detected_keywords = state.get('detected_keywords', {})
+
+    is_remix = "OLD QUESTION (BLUEPRINT)" in context
+    task = "Create a BRAND NEW dataset/problem variation using numbers from Web Examples." if is_remix else "Create a rigorous problem based on the Context."
+
+    logger.info(f"[Phase 2A] Code Generation ({'REMIXING' if is_remix else 'NEW'})...")
+
+    # Build keyword-specific instructions based on what user asked for
+    keyword_instructions = ""
+    if detected_keywords:
+        keyword_instructions = "\n\n**USER REQUESTED SPECIFIC CONTENT TYPE - FOLLOW THESE INSTRUCTIONS:**\n"
+        for keyword in detected_keywords.keys():
+            if keyword in ["pseudo-code", "pseudocode", "algorithm", "code"]:
+                keyword_instructions += f"""
+    - The user specifically asked about "{keyword}" - Your question MUST focus on the ALGORITHM/PSEUDO-CODE
+    - Use the pseudo-code/algorithm from the PDF context labeled "RELEVANT {keyword.upper()} CONTENT"
+    - The question should ask students to trace through or apply the EXACT algorithm steps from the PDF
+    - DO NOT create a generic calculation question - it MUST be about following the algorithm steps
+    - Include the algorithm/pseudo-code steps in the verification code comments
+"""
+            elif keyword in ["trace", "example", "step"]:
+                keyword_instructions += f"""
+    - The user specifically asked about "{keyword}" - Your question MUST be a TRACE/STEP-BY-STEP problem
+    - The question should ask students to manually trace through the algorithm execution
+    - Show intermediate states at each step
+    - The verification code should output step-by-step execution trace
+"""
+            elif keyword in ["complexity", "time", "space"]:
+                keyword_instructions += f"""
+    - The user specifically asked about "{keyword}" - Your question MUST focus on COMPLEXITY ANALYSIS
+    - Ask about time complexity, space complexity, or big-O analysis
+    - Reference complexity formulas from the PDF
+"""
+            elif keyword in ["definition", "theorem", "formula"]:
+                keyword_instructions += f"""
+    - The user specifically asked about "{keyword}" - Focus on the THEORETICAL aspect
+    - Use definitions or formulas EXACTLY as shown in the PDF
+    - The question should test understanding of the concept, not just computation
+"""
+
+    critique_prompt = ""
+    if state.get('verification_error'):
+        critique_prompt = f"\n[CODE ERROR FROM PREVIOUS ATTEMPT]: {state['verification_error']}\nFix the code."
+
+    system_prompt = f"""
+    You are an Expert Professor creating exam problems.
+    Topic: {state['topic']} | Difficulty: {state['target_difficulty']}
+
+    TASK: {task}
+
+    **INSTRUCTIONS:**
+    1. Use the PDF context below as reference for formulas/methods
+    2. Write Python code that creates a dataset and computes the answer
+    3. Code must print() the final answer with key steps shown
+    4. Use raw input data - don't hardcode intermediate values
+
+    **DIFFICULTY:**
+    - Easy: ~15-20 data points, single question
+    - Medium: ~20-30 data points, may have 2 parts
+    - Hard: ~30-50 data points, 2-3 parts required
+
+    **CODE REQUIREMENTS:**
+    - Define dataset as Python data structure
+    - Compute everything dynamically (no hardcoded counts)
+    - Print answer showing key steps/sequence
+    - End with print(answer)
+
+    Context:
+    {context[:12000]}
+    {keyword_instructions}
+    {critique_prompt}
+    """
+
+    llm = get_llm(json_mode=CodeDraft, mode="auto")
+
+    try:
+        response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content="Generate code.")])
+        return {'code_draft': response.model_dump()}
+    except Exception as e:
+        logger.error(f"Code generation failed: {e}")
+        return {'use_fallback': True, 'verification_error': str(e)}
+
+@timed_node("executor")
+def execute_code(state: AgentState) -> Dict:
+    """PHASE 2B: Execute the generated code to get actual result"""
+    if state.get('use_fallback'): return {}
+
+    code_draft = state.get('code_draft', {})
+    code = code_draft.get('verification_code')
+
+    if not code:
+        return {'use_fallback': True, 'verification_error': "No code generated"}
+
+    logger.info("[Phase 2B] Executing Code...")
+    result = math_tool.run(code)
+
+    if "Error" in result:
+        logger.warning(f"Code Execution Failed: {result}")
+        if state['iteration_count'] >= 2:
+            return {'use_fallback': True, 'verification_passed': False}
+        return {
+            'verification_passed': False,
+            'verification_error': result,
+            'iteration_count': state['iteration_count'] + 1,
+            'code_draft': None  # Clear to regenerate
+        }
+
+    logger.info(f"Code Executed Successfully. Output: {result.strip()}")
+
+    # ANSWER SANITY VALIDATION
+    # Check if the answer is mathematically invalid for certain topics
+    result_stripped = result.strip()
+    topic_lower = state['topic'].lower()
+
+    # Detect invalid answers based on topic
+    is_invalid = False
+    sanity_error = None
+
+    try:
+        # Try to extract numeric value from result
+        import re
+        numeric_match = re.search(r'[-+]?[0-9]*\.?[0-9]+', result_stripped)
+        if numeric_match:
+            numeric_value = float(numeric_match.group())
+
+            # Gini index validation: should be in range (0, 0.5] for binary classification
+            # Value of 0.0 means perfect purity (all same class), which is unlikely for real problems
+            if 'gini' in topic_lower:
+                if numeric_value == 0.0:
+                    is_invalid = True
+                    sanity_error = "Gini index returned 0.0 (perfect purity). This is unlikely for the given dataset. Code may have a bug."
+                elif numeric_value < 0 or numeric_value > 0.5:
+                    is_invalid = True
+                    sanity_error = f"Gini index {numeric_value} is outside valid range [0, 0.5] for binary classification."
+
+            # Information gain validation: should be positive for useful attributes
+            elif 'information gain' in topic_lower or 'entropy' in topic_lower:
+                if numeric_value < 0:
+                    is_invalid = True
+                    sanity_error = f"Information gain/entropy cannot be negative (got {numeric_value})."
+
+            # Error rate validation: should be in [0, 1]
+            elif 'error' in topic_lower and 'rate' in topic_lower:
+                if numeric_value < 0 or numeric_value > 1:
+                    is_invalid = True
+                    sanity_error = f"Error rate {numeric_value} is outside valid range [0, 1]."
+
+            # Probability validation: should be in [0, 1]
+            elif 'probability' in topic_lower or 'likelihood' in topic_lower:
+                if numeric_value < 0 or numeric_value > 1:
+                    is_invalid = True
+                    sanity_error = f"Probability {numeric_value} is outside valid range [0, 1]."
+
+    except (ValueError, AttributeError):
+        # If we can't parse a number, skip sanity check
+        pass
+
+    if is_invalid:
+        logger.warning(f"Answer Sanity Check Failed: {sanity_error}")
+        if state['iteration_count'] >= 2:
+            # After 2 retries, give up
+            return {'use_fallback': True, 'verification_passed': False}
+        # Trigger code regeneration
+        return {
+            'verification_passed': False,
+            'verification_error': sanity_error,
+            'iteration_count': state['iteration_count'] + 1,
+            'code_draft': None  # Clear to regenerate
+        }
+
+    return {
+        'computed_result': result_stripped,
+        'verification_passed': True
+    }
+
+@timed_node("question_author")
+def generate_question_from_result(state: AgentState) -> Dict:
+    """PHASE 2C: Generate complete question in a single call for reliability"""
+    if state.get('use_fallback'): return {}
+
+    code_draft = state.get('code_draft', {})
+    computed_result = state.get('computed_result', '')
+    context = state.get('retrieved_context', '')
+    question_type = state.get('question_type', 'calculation')  # Default to calculation for computational
+
+    # Truncate to keep context manageable
+    MAX_RESULT_LENGTH = 1500
+    MAX_CODE_LENGTH = 2000
+
+    if len(computed_result) > MAX_RESULT_LENGTH:
+        half = MAX_RESULT_LENGTH // 2
+        computed_result = computed_result[:half] + "\n...[truncated]...\n" + computed_result[-half:]
+
+    verification_code = code_draft.get('verification_code', '')
+    if len(verification_code) > MAX_CODE_LENGTH:
+        verification_code = verification_code[:MAX_CODE_LENGTH] + "\n# ..."
+
+    logger.info(f"[Phase 2C] Writing Question (type={question_type})...")
+
+    # Build format instructions based on question_type
+    if question_type == 'mcq':
+        format_instruction = """
+FORMAT: Multiple Choice Question (MCQ)
+- Present a clear question stem with the problem/calculation
+- Provide exactly 4 options labeled A), B), C), D)
+- Put each option on a NEW LINE
+- Only ONE option should be correct (matching the computed answer)
+- The answer field should be just the letter (e.g., "A")
+- Include plausible distractors based on common calculation errors
+"""
+    elif question_type == 'long':
+        format_instruction = """
+FORMAT: Long Answer / Calculation Question
+- Create a multi-part question with (a), (b), (c) parts
+- Each part should build on the previous or test related calculations
+- DO NOT use MCQ format - students should show their working
+- The answer should include step-by-step calculations
+- Separate parts clearly with blank lines
+"""
+    elif question_type == 'short':
+        format_instruction = """
+FORMAT: Short Answer / Calculation Question
+- Create a focused calculation question
+- DO NOT use MCQ format - students should show their working
+- The answer should be the computed result with brief explanation
+"""
+    elif question_type == 'trace':
+        format_instruction = """
+FORMAT: Algorithm Trace Question
+- Ask students to trace through the algorithm step-by-step
+- Show initial state and ask for intermediate/final states
+- The answer should show the trace at each step
+"""
+    else:
+        format_instruction = """
+FORMAT: Calculation Question
+- Create a question requiring numerical computation
+- Include all necessary data in a clear format (tables if appropriate)
+- The answer should match the computed result
+- For Medium/Hard, include multiple parts (a), (b), etc.
+"""
+
+    # Single comprehensive prompt for better quality
+    system_prompt = f"""You are an expert professor creating an exam question.
+
+Topic: {state['topic']}
+Difficulty: {state['target_difficulty']}
+
+Reference material from PDF:
+{context[:3000]}
+
+Verification code that computes the answer:
+```python
+{verification_code}
+```
+
+Computed answer from code:
+{computed_result}
+
+Create a well-structured exam question based on this information.
+
+{format_instruction}
+
+GENERAL FORMATTING REQUIREMENTS:
+- Use SHORT paragraphs (2-3 sentences max)
+- Add BLANK LINES between different sections of the question
+- Present data as a clean markdown table with blank lines before and after
+- For multi-part questions, clearly separate parts with blank lines
+- Use markdown formatting (bold, lists, tables) where appropriate
+- The answer MUST match the computed result above"""
+
+    llm = get_llm(json_mode=QuestionDraft, mode="auto")
+
+    try:
+        type_instruction = f" as a {question_type.upper()} question" if question_type else ""
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Create a {state['target_difficulty']} difficulty question about {state['topic']}{type_instruction}.")
+        ])
+        q_data = response.model_dump()
+        q_data['verification_code'] = verification_code
+        q_data['computed_answer'] = computed_result
+        q_data['question_type'] = question_type  # Preserve the requested type
+
+        # Self-refinement step
+        q_data = refine_question(q_data, state['topic'], state['target_difficulty'], question_type)
+
+        logger.info("[Phase 2C] Question generation complete")
+        return {'question_data': q_data}
+    except Exception as e:
+        logger.error(f"Question generation failed: {e}")
+        # Return minimal valid data to avoid fallback cascade
+        return {
+            'question_data': {
+                'question': f"Explain the concept of {state['topic']} and provide an example calculation.",
+                'answer': computed_result or "See explanation",
+                'explanation': f"This question tests understanding of {state['topic']}.",
+                'verification_code': verification_code,
+                'computed_answer': computed_result,
+                'difficulty_rating': state['target_difficulty'],
+                'question_type': question_type,
+                'options': None
+            }
+        }
+
+def generate_draft(state: AgentState) -> Dict:
+    if state.get('use_fallback'): return {}
+    context = state.get('retrieved_context', '')
+    
+    is_remix = "OLD QUESTION (BLUEPRINT)" in context
+    
+    task = "Create a BRAND NEW variation of the Old Question using new numbers from Web Examples." if is_remix else "Create a rigorous exam question based on the Context."
+    
+    logger.info(f"[Phase 2] Authoring ({'REMIXING' if is_remix else 'NEW CREATION'})...")
+
+    critique_prompt = ""
+    if state.get('critique'):
+        c = state['critique']
+        critique_prompt = f"\n[PREVIOUS FEEDBACK]: {c.get('feedback')}"
+    if state.get('verification_error'):
+        critique_prompt += f"\n[CODE ERROR]: {state['verification_error']}"
+
+    # Check if this is an answer mismatch retry
+    answer_validation_count = state.get('answer_validation_count', 0)
+    if answer_validation_count > 0:
+        critique_prompt += f"""
+[CRITICAL - ANSWER MISMATCH DETECTED - Attempt #{answer_validation_count}]:
+Your previous manual answer did NOT match what the code computed.
+
+TO FIX THIS:
+1. Look at your verification_code
+2. Trace through it step by step:
+   - What does "sum(1 for row in data if ...)" count? Count the matching items.
+   - What do the formulas compute using those counts? Calculate step by step.
+3. What does the final print() statement output? Write that EXACT string in 'answer'
+
+DO NOT calculate independently - TRACE THE CODE EXECUTION.
+"""
+
+    system_prompt = f"""
+    You are an Expert Professor.
+    Topic: {state['topic']} | Difficulty: {state['target_difficulty']}
+
+    TASK: {task}
+
+    CRITICAL INSTRUCTIONS FOR VERIFICATION CODE:
+    - Change the input values/dataset so the answer is different from the blueprint.
+    - Write a Python script ('verification_code') that calculates the NEW answer.
+    - The script MUST contain `print(answer)` at the end.
+
+    **MANDATORY CODE STRUCTURE - NEVER HARDCODE VALUES:**
+    1. ALWAYS define the dataset as a Python data structure (list of dicts, etc.)
+    2. ALWAYS count/compute values DYNAMICALLY from that data structure
+    3. NEVER manually hardcode counts like "pos_A_T = 4" - use loops/comprehensions
+    4. Example CORRECT approach:
+       ```python
+       data = [{{'A': 'T', 'B': 'F', 'Class': '+'}}, ...]
+       pos_A_T = sum(1 for row in data if row['A'] == 'T' and row['Class'] == '+')
+       ```
+    5. Example WRONG approach (DO NOT DO THIS):
+       ```python
+       pos_A_T = 4  # ❌ WRONG - hardcoded!
+       ```
+
+    **ANSWER FIELD - CRITICAL:**
+    - First write the verification_code completely
+    - Then mentally RUN the code line by line to predict the print() output
+    - The 'answer' field = your predicted print() output
+    - Example: If code prints "IG(A) = 0.61, IG(B) = 0.03, Choose A", write exactly that
+    - DO NOT calculate manually - trace the code's data flow and operations
+    - For counts: trace the list comprehensions (e.g., "sum(1 for row in data if ...)" → count items)
+    - For formulas: trace the arithmetic using the counts from step above
+    - Double-check: Does your answer match what the code would print?
+
+    **EXPLANATION FIELD - CRITICAL:**
+    - DO NOT show manual arithmetic calculations in the explanation
+    - Instead, describe the ALGORITHM/LOGIC the code uses
+    - Reference the code execution: "The code computes..." or "When the algorithm runs..."
+    - If you must show intermediate values, derive them by tracing the code, not manual math
+    - NEVER write calculations like "IG(A) = 0.94 - ((4/10)*0.81 + (6/10)*0.92)" unless you traced these exact values from code execution
+
+    Context:
+    {context[:12000]}
+
+    {critique_prompt}
+    """
+    
+    mode = "thinking" if state['revision_count'] > 0 else "auto"
+    llm = get_llm(json_mode=QuestionDraft, mode=mode)
+    
+    try:
+        response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content="Draft.")])
+        return {'question_data': response.model_dump()}
+    except Exception as e:
+        logger.error(f"Author failed: {e}")
+        return {'use_fallback': True, 'verification_error': str(e)}
+
+def critique_draft(state: AgentState) -> Dict:
+    if state.get('use_fallback'): return {}
+    if state.get('verification_error'): return {'critique': {'is_passing': True, 'score': 7}}
+
+    q = state['question_data']
+    code_draft = state.get('code_draft', {})
+
+    system_prompt = f"""
+    Review this exam question. Target Difficulty: {state['target_difficulty']}
+
+    Question: {q.get('question')}
+    Answer: {q.get('answer')}
+
+    **EVALUATION CRITERIA:**
+
+    1. **Validity** (Required):
+       - Is the question solvable with the given information?
+       - Is the answer correct and reasonable?
+       - Are there any ambiguities or unclear instructions?
+
+    2. **Difficulty Match** (Required):
+       Target: {state['target_difficulty']}
+
+       Dataset Complexity Expectations:
+       - Easy: 15-20 data points, 3-4 attributes, multi-step calculation, single focused question
+       - Medium: 20-30 data points, 4-5 attributes, complex multi-step process, may have 2 parts
+       - Hard: 30-50 data points, 5+ attributes, extensive calculations, edge cases, MUST have 2-3 parts
+
+       Multi-part Question Requirements:
+       - Easy: Single question is fine
+       - Medium: Should consider having Part (a) and Part (b)
+       - Hard: MUST have multiple parts (a), (b), and optionally (c)
+
+       Does the dataset SIZE, COMPLEXITY, and NUMBER OF PARTS match the target difficulty?
+
+    3. **Quality** (Required):
+       - Is the data realistic and meaningful?
+       - Does it follow the PDF formulas correctly?
+       - Is the explanation clear?
+
+    **GRADING:**
+    - Score 8-10: Valid, matches difficulty, high quality → PASS
+    - Score 7: Acceptable but could be improved → PASS
+    - Score 0-6: Too simple/complex for difficulty, or has issues → REJECT
+
+    Verification Code (for context):
+    ```python
+    {code_draft.get('verification_code', '')[:500]}
+    ```
+    """
+
+    llm = get_llm(json_mode=CritiqueResult, mode="thinking")
+    logger.info("[Phase 3] Critic Reviewing...")
+
+    try:
+        result = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content="Grade this question against the difficulty target.")])
+        status = "PASS" if result.is_passing else "REJECT"
+        logger.info(f"Critic Score: {result.score}/10 [{status}]")
+
+        # Increment revision_count when rejecting to prevent infinite loops
+        if not result.is_passing:
+            current_count = state.get('revision_count', 0)
+            logger.info(f"Critic rejected - Revision count: {current_count} -> {current_count + 1}")
+            return {
+                'critique': result.model_dump(),
+                'revision_count': current_count + 1
+            }
+
+        return {'critique': result.model_dump()}
+    except Exception:
+        return {'critique': {'is_passing': True, 'score': 8}}
+
+def verify_code(state: AgentState) -> Dict:
+    if state.get('use_fallback'): return {}
+    q_data = state.get('question_data', {})
+    code = q_data.get('verification_code')
+
+    if not code:
+        logger.info("No code. Skipping verification.")
+        return {'verification_passed': True}
+
+    logger.info("[Phase 4] Verifying Logic...")
+    result = math_tool.run(code)
+
+    if "Error" in result:
+        logger.warning(f"Verification Failed: {result}")
+        if state['iteration_count'] >= 2:
+            return {'use_fallback': True, 'verification_passed': False}
+        return {'verification_passed': False, 'verification_error': result, 'iteration_count': state['iteration_count'] + 1}
+
+    logger.info(f"Verification Successful. Output: {result.strip()}")
+    q_data['computed_answer'] = result.strip()
+    return {'verification_passed': True, 'question_data': q_data}
+
+class QuestionCodeValidation(BaseModel):
+    is_valid: bool = Field(description="True if question text matches what the code actually computes")
+    reasoning: str = Field(description="Explanation of whether the question asks for what the code computes")
+    issues: List[str] = Field(description="List of specific misalignments between question and code")
+
+def validate_question_code_alignment(state: AgentState) -> Dict:
+    """Validate that the question text asks students to compute what the code actually computes."""
+    if state.get('use_fallback'): return {}
+
+    q_data = state.get('question_data', {})
+    code_draft = state.get('code_draft', {})
+
+    question_text = q_data.get('question', '')
+    verification_code = code_draft.get('verification_code', '')
+    dataset_description = code_draft.get('dataset_description', '')
+
+    # Skip if no verification code
+    if not verification_code:
+        logger.info("[Phase 5] No verification code to validate against.")
+        return {'answer_mismatch': False}
+
+    logger.info("[Phase 5] Validating Question-Code Alignment...")
+
+    validation_count = state.get('answer_validation_count', 0)
+
+    system_prompt = f"""
+    You are a rigorous validator for exam questions.
+
+    TASK: Verify that the QUESTION TEXT asks students to compute what the VERIFICATION CODE actually computes.
+
+    QUESTION TEXT (what students are asked to solve):
+    {question_text}
+
+    VERIFICATION CODE (what the code actually computes):
+    ```python
+    {verification_code}
+    ```
+
+    DATASET DESCRIPTION:
+    {dataset_description}
+
+    CRITICAL VALIDATION RULES:
+    1. Does the question provide the EXACT SAME input data that the code uses?
+       - Check: Are the dataset values in the question identical to those in the code?
+       - Example: If code has data = [{{'A': 'T', 'B': 'F'}}], question must show same table
+
+    2. Does the question ask students to compute the SAME OUTPUT as the code?
+       - Check: What does the code's final print() statement output?
+       - Check: Does the question ask for that same calculation?
+
+    3. Are there any shortcuts or pre-calculated values given in the question that the code computes?
+       - BAD: Question gives intermediate results that the code is supposed to calculate
+       - GOOD: Question gives only raw input data, asks students to compute the final result
+
+    4. Does the question match the algorithm/formula the code implements?
+       - The method/formula asked in the question must match what the code actually computes
+
+    Mark is_valid = False if:
+    - Question provides different input data than code uses
+    - Question asks for different output than code computes
+    - Question gives away pre-calculated values that students should compute
+    - Question asks for wrong formula/algorithm
+
+    Mark is_valid = True if:
+    - Question presents the exact input data from the code
+    - Question asks students to compute exactly what the code computes
+    - No shortcuts or pre-calculated intermediate values given
+    """
+
+    llm = get_llm(json_mode=QuestionCodeValidation, mode="thinking")
+
+    try:
+        result = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content="Validate the alignment between question and code. Be strict.")
+        ])
+
+        status = "✓ ALIGNED" if result.is_valid else "✗ MISALIGNED"
+        logger.info(f"Question-Code Validation: {status}")
+        logger.info(f"Reasoning: {result.reasoning}")
+        if result.issues:
+            logger.info(f"Issues: {', '.join(result.issues)}")
+
+        if not result.is_valid:
+            if validation_count >= 1:
+                # After 2 attempts, add warning and proceed
+                logger.warning("  QUESTION-CODE MISALIGNMENT PERSISTS - Proceeding with warning")
+                q_data['answer_warning'] = f" WARNING: Question may not match code logic. Issues: {', '.join(result.issues)}"
+                return {
+                    'answer_mismatch': False,  # Allow it to pass but with warning
+                    'question_data': q_data
+                }
+            else:
+                # First misalignment - request regeneration
+                logger.warning(f"Question-code misalignment detected. Requesting regeneration (attempt {validation_count + 1}/2)")
+                return {
+                    'answer_mismatch': True,
+                    'verification_error': f"Question text doesn't align with code logic. {result.reasoning}. Issues: {', '.join(result.issues)}",
+                    'answer_validation_count': validation_count + 1,
+                    'revision_count': state['revision_count'] + 1
+                }
+
+        return {'answer_mismatch': False}
+
+    except Exception as e:
+        logger.error(f"Question-code validation failed: {e}")
+        # On error, assume they're aligned to avoid blocking
+        return {'answer_mismatch': False}
+
+@timed_node("reviewer")
+def parallel_review(state: AgentState) -> Dict:
+    """Run critic and validator in PARALLEL for faster review"""
+    if state.get('use_fallback'):
+        return {}
+
+    logger.info("[Phase 3+5] Running Critic & Validator in PARALLEL...")
+
+    results = {}
+
+    def run_critique():
+        return _run_critique_logic(state)
+
+    def run_validation():
+        return _run_validation_logic(state)
+
+    # Run both in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_critique = executor.submit(run_critique)
+        future_validation = executor.submit(run_validation)
+
+        for future in as_completed([future_critique, future_validation]):
+            try:
+                result = future.result()
+                results.update(result)
+            except Exception as e:
+                logger.error(f"Review task failed: {e}")
+
+    logger.info(f"Parallel review complete - Critique: {results.get('critique', {}).get('score', '?')}/10")
+    return results
+
+def _run_critique_logic(state: AgentState) -> Dict:
+    """Critique logic extracted for parallel execution"""
+    if state.get('verification_error'):
+        return {'critique': {'is_passing': True, 'score': 7}}
+
+    q = state['question_data']
+    code_draft = state.get('code_draft', {})
+
+    system_prompt = f"""
+    Review this exam question. Target Difficulty: {state['target_difficulty']}
+
+    Question: {q.get('question')}
+    Answer: {q.get('answer')}
+
+    **EVALUATION CRITERIA:**
+
+    1. **Validity** (Required):
+       - Is the question solvable with the given information?
+       - Is the answer correct and reasonable?
+
+    2. **Difficulty Match** (Required):
+       Target: {state['target_difficulty']}
+       - Easy: 15-20 data points, single focused question
+       - Medium: 20-30 data points, may have 2 parts
+       - Hard: 30-50 data points, MUST have 2-3 parts
+
+    3. **Quality** (Required):
+       - Is the data realistic?
+       - Does it follow the PDF formulas?
+
+    **GRADING:**
+    - Score 8-10: Valid, matches difficulty → PASS
+    - Score 7: Acceptable → PASS
+    - Score 0-6: Issues → REJECT
+
+    Verification Code:
+    ```python
+    {code_draft.get('verification_code', '')[:500]}
+    ```
+    """
+
+    llm = get_llm(json_mode=CritiqueResult, mode="auto")
+
+    try:
+        result = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content="Grade quickly.")])
+        status = "PASS" if result.is_passing else "REJECT"
+        logger.info(f"Critic Score: {result.score}/10 [{status}]")
+        return {'critique': result.model_dump()}
+    except Exception:
+        return {'critique': {'is_passing': True, 'score': 8}}
+
+def _run_validation_logic(state: AgentState) -> Dict:
+    """Validation logic extracted for parallel execution - includes strict answer comparison"""
+    q_data = state.get('question_data', {})
+    code_draft = state.get('code_draft', {})
+
+    question_text = q_data.get('question', '')
+    stated_answer = q_data.get('answer', '')
+    verification_code = code_draft.get('verification_code', '') or q_data.get('verification_code', '')
+
+    if not verification_code:
+        return {'answer_mismatch': False}
+
+    validation_count = state.get('answer_validation_count', 0)
+
+    # STRICT VERIFICATION: Re-run code and compare output to stated answer
+    try:
+        code_output = math_tool.run(verification_code)
+        if "Error" not in code_output:
+            code_output_clean = code_output.strip().lower()
+            stated_answer_clean = stated_answer.strip().lower() if stated_answer else ""
+
+            # Extract key values for comparison
+            import re
+
+            # Extract numbers from both
+            code_numbers = set(re.findall(r'[-+]?\d*\.?\d+', code_output_clean))
+            answer_numbers = set(re.findall(r'[-+]?\d*\.?\d+', stated_answer_clean))
+
+            # Extract letter answers (A, B, C, D) for MCQ
+            code_letters = set(re.findall(r'\b([a-d])\b', code_output_clean))
+            answer_letters = set(re.findall(r'\b([a-d])\b', stated_answer_clean))
+
+            # Check for numeric mismatch
+            numeric_match = bool(code_numbers & answer_numbers) if code_numbers and answer_numbers else True
+            letter_match = bool(code_letters & answer_letters) if code_letters and answer_letters else True
+
+            if not numeric_match and code_numbers and answer_numbers:
+                mismatch_msg = f"Code outputs {code_numbers} but answer states {answer_numbers}"
+                logger.warning(f"[STRICT] Answer mismatch detected: {mismatch_msg}")
+                q_data['answer_verification'] = {
+                    'code_output': code_output.strip()[:200],
+                    'match': False,
+                    'issue': mismatch_msg
+                }
+            elif not letter_match and code_letters and answer_letters:
+                mismatch_msg = f"Code outputs {code_letters} but answer states {answer_letters}"
+                logger.warning(f"[STRICT] Answer mismatch detected: {mismatch_msg}")
+                q_data['answer_verification'] = {
+                    'code_output': code_output.strip()[:200],
+                    'match': False,
+                    'issue': mismatch_msg
+                }
+            else:
+                logger.info(f"[STRICT] Answer verification passed - code output matches stated answer")
+                q_data['answer_verification'] = {
+                    'code_output': code_output.strip()[:200],
+                    'match': True
+                }
+    except Exception as e:
+        logger.warning(f"[STRICT] Could not verify answer: {e}")
+
+    # LLM-based validation for question-code alignment
+    system_prompt = f"""
+    Verify that the QUESTION TEXT matches what the CODE computes.
+
+    QUESTION TEXT:
+    {question_text[:2000]}
+
+    CODE:
+    ```python
+    {verification_code[:1500]}
+    ```
+
+    Check:
+    1. Does question provide same input data as code?
+    2. Does question ask for same output as code computes?
+
+    Mark is_valid = False if there's a mismatch.
+    """
+
+    llm = get_llm(json_mode=QuestionCodeValidation, mode="auto")
+
+    try:
+        result = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content="Validate quickly.")
+        ])
+
+        if not result.is_valid:
+            if validation_count >= 1:
+                q_data['answer_warning'] = f"WARNING: Possible mismatch. {', '.join(result.issues)}"
+                return {'answer_mismatch': False, 'question_data': q_data}
+            else:
+                return {
+                    'answer_mismatch': True,
+                    'verification_error': f"Mismatch: {result.reasoning}",
+                    'answer_validation_count': validation_count + 1
+                }
+
+        return {'answer_mismatch': False, 'question_data': q_data}
+
+    except Exception as e:
+        logger.error(f"Validation failed: {e}")
+        return {'answer_mismatch': False}
+
+@timed_node("fallback")
+def use_fallback(state: AgentState) -> Dict:
+    logger.warning("[Fallback] Main generation failed. Using simplified generation.")
+    context = state['retrieved_context']
+    question_type = state.get('question_type', 'short')
+
+    llm = get_llm(json_mode=QuestionDraft, mode="auto")
+
+    # Build format instructions based on question_type
+    if question_type == 'mcq':
+        format_instruction = """
+FORMAT: Multiple Choice Question (MCQ)
+- Present a clear question stem
+- Provide exactly 4 options labeled A), B), C), D)
+- Put each option on a NEW LINE
+- Only ONE option should be correct
+- The answer should be just the letter (e.g., "A")
+"""
+    elif question_type == 'long':
+        format_instruction = """
+FORMAT: Long Answer / Essay Question
+- Create a multi-part question with (a), (b), (c) parts
+- Each part should require a detailed explanation
+- DO NOT use MCQ format - this is a written response question
+- The answer should be comprehensive for each part
+"""
+    elif question_type == 'short':
+        format_instruction = """
+FORMAT: Short Answer Question
+- Create a focused question answerable in 2-5 sentences
+- DO NOT use MCQ format - this requires a written response
+- The answer should be concise but complete
+"""
+    else:
+        format_instruction = """
+FORMAT: Open-ended Question
+- Create a question appropriate for the topic
+- The answer should be clear and comprehensive
+"""
+
+    # Better fallback prompt that actually generates a question
+    system_prompt = f"""You are an expert professor creating an exam question.
+
+Topic: {state['topic']}
+Difficulty: {state['target_difficulty']}
+
+Using the following reference material, create a clear, well-structured exam question:
+
+{context[:6000]}
+
+{format_instruction}
+
+GENERAL FORMATTING REQUIREMENTS:
+- Use SHORT paragraphs (2-3 sentences max)
+- Add BLANK LINES between different sections of the question
+- Present data as a clean markdown table with blank lines before and after
+- For multi-part questions, clearly separate parts with blank lines
+- Use markdown formatting (bold, lists, tables) where appropriate
+
+The question should be appropriate for the difficulty level specified."""
+
+    try:
+        type_instruction = f" as a {question_type.upper()} question" if question_type else ""
+        response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=f"Create a {state['target_difficulty']} {state['topic']} question{type_instruction}.")])
+        q_data = response.model_dump()
+        q_data['question_type'] = question_type  # Preserve the requested type
+
+        # Self-refinement step
+        q_data = refine_question(q_data, state['topic'], state['target_difficulty'], question_type)
+
+        return {'question_data': q_data, 'verification_passed': True, 'source_type': f"{state['source_type']} (fallback)"}
+    except Exception as e:
+        logger.error(f"Fallback generation failed: {e}")
+        return {'verification_passed': False}
+
+@timed_node("use_cache")
+def use_cached_question(state: AgentState) -> Dict:
+    """Use a cached question from the question bank instead of generating new."""
+    cached = state.get('cached_question')
+    if not cached:
+        logger.warning("[CACHE] No cached question found, falling back to generation")
+        return {'use_fallback': True}
+
+    logger.info(f"[CACHE] Using cached question (similarity: {cached.get('similarity_score', 0):.2f})")
+
+    # Convert cached format to question_data format
+    question_data = {
+        'question': cached.get('question_text') or cached.get('question', ''),
+        'answer': cached.get('answer', ''),
+        'explanation': cached.get('explanation', ''),
+        'verification_code': cached.get('python_code') or cached.get('verification_code', ''),
+        'from_cache': True,
+        'cache_similarity': cached.get('similarity_score', 0)
+    }
+
+    return {
+        'question_data': question_data,
+        'verification_passed': True,
+        'source_type': 'question_bank_cache'
+    }
+
+
+@timed_node("archivist")
+def save_result(state: AgentState) -> Dict:
+    if not state.get('verification_passed'): return {}
+    q = state.get('question_data', {})
+    # Don't save if it came from cache (already in bank)
+    if q.get('from_cache'):
+        logger.info("[CACHE] Skipping save - question was from cache")
+        return {}
+    if q and 'question' in q:
+        save_template(
+            state['topic'],
+            state['target_difficulty'],
+            q['question'],
+            q.get('verification_code', ''),
+            state['source_type'],
+            full_data=q,
+            source_urls=state.get('source_urls', [])
+        )
+    return {}
+
+def build_graph():
+    workflow = StateGraph(AgentState)
+
+    # TWO-PASS PIPELINE: Code-First Architecture with PARALLEL REVIEW
+    # NEW: Theory path for conceptual topics (no code needed)
+    # NEW: Cache path for duplicate detection
+    workflow.add_node("scout", check_sources)
+    workflow.add_node("use_cache", use_cached_question)  # NEW: Use cached question
+    workflow.add_node("theory_author", generate_theory_question)  # For conceptual topics
+    workflow.add_node("code_author", generate_code_only)
+    workflow.add_node("executor", execute_code)
+    workflow.add_node("question_author", generate_question_from_result)
+    workflow.add_node("reviewer", parallel_review)  # PARALLEL: runs critic + validator together
+    workflow.add_node("fallback", use_fallback)
+    workflow.add_node("archivist", save_result)
+
+    workflow.set_entry_point("scout")
+
+    # 1. Scout -> Route based on cache hit or topic type
+    def route_after_scout(state):
+        if state.get('use_fallback'):
+            return "fallback"
+        # Check for cache hit first
+        if state.get('cached_question'):
+            return "use_cache"
+        if state.get('is_conceptual'):
+            return "theory_author"  # Skip code for conceptual topics
+        return "code_author"
+
+    workflow.add_conditional_edges(
+        "scout",
+        route_after_scout,
+        {"fallback": "fallback", "use_cache": "use_cache", "theory_author": "theory_author", "code_author": "code_author"}
+    )
+
+    # Cache -> directly to save (skip all generation)
+    workflow.add_edge("use_cache", "archivist")
+
+    # Theory path goes straight to reviewer (no code execution needed)
+    workflow.add_conditional_edges(
+        "theory_author",
+        lambda x: "fallback" if x.get('use_fallback') else "reviewer",
+        {"fallback": "fallback", "reviewer": "reviewer"}
+    )
+
+    # 2. Code Generation -> Executor (or Fallback)
+    workflow.add_conditional_edges(
+        "code_author",
+        lambda x: "fallback" if x.get('use_fallback') else "executor",
+        {"fallback": "fallback", "executor": "executor"}
+    )
+
+    # 3. Code Execution -> Question Writer (or Retry Code)
+    workflow.add_conditional_edges(
+        "executor",
+        lambda x: "fallback" if x.get('use_fallback') else "question_author" if x.get('verification_passed') else "code_author",
+        {"fallback": "fallback", "question_author": "question_author", "code_author": "code_author"}
+    )
+
+    # 4. Question Generation -> Parallel Review (critic + validator run together)
+    workflow.add_conditional_edges(
+        "question_author",
+        lambda x: "fallback" if x.get('use_fallback') else "reviewer",
+        {"fallback": "fallback", "reviewer": "reviewer"}
+    )
+
+    # 5. Parallel Review -> Save (or Retry if failed)
+    def route_after_review(state):
+        if state.get('use_fallback'):
+            return "fallback"
+
+        # Check critique result
+        is_passing = state.get('critique', {}).get('is_passing', True)
+        revision_count = state.get('revision_count', 0)
+
+        # Retry up to 2 times if critic fails
+        if not is_passing and revision_count < 2:
+            return "retry"
+
+        # Check validation result
+        if state.get('answer_mismatch'):
+            return "retry"
+
+        return "save"
+
+    workflow.add_conditional_edges(
+        "reviewer",
+        route_after_review,
+        {"fallback": "fallback", "retry": "code_author", "save": "archivist"}
+    )
+
+    workflow.add_edge("fallback", "archivist")
+    workflow.add_edge("archivist", END)
+
+    return workflow.compile()
+
+# ========== AUTO-TAGGING ==========
+
+def auto_tag_question(topic: str, question_type: str, difficulty: str) -> List[str]:
+    """
+    Generate automatic tags for a question based on topic and type.
+    Tags are loaded from config/tags.yaml - extensible for any domain (physics, chemistry, etc.)
+    """
+    tags = set()
+
+    # Add difficulty tag
+    tags.add(f"difficulty:{difficulty.lower()}")
+
+    # Add question type tag
+    if question_type:
+        tags.add(f"type:{question_type.lower()}")
+
+    # Get topic-based tags from config (supports any domain)
+    topic_tags = get_tags(topic)
+    tags.update(topic_tags)
+
+    return sorted(list(tags))
+
+
+_graph = None
+
+def get_graph():
+    """Get cached compiled graph. Builds once, reuses thereafter."""
+    global _graph
+    if _graph is None:
+        logger.info("[Graph Cache] Building graph for first time...")
+        _graph = build_graph()
+    return _graph
+
+def rebuild_graph():
+    """Force rebuild of graph (use after code changes in dev)."""
+    global _graph
+    _graph = None
+    return get_graph()
+
+def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None):
+    graph = get_graph()  # Use cached graph
+    logger.info(f"Tribunal Engine Started for Topic: {topic}, Type: {question_type}")
+
+    # Determine if conceptual based on question_type
+    # mcq, short, long are typically conceptual; numerical, trace, calculation are computational
+    # If question_type is None, leave is_conceptual as None so check_sources can auto-detect
+    if question_type:
+        is_conceptual = question_type in ('short', 'long', 'mcq', 'theory', 'conceptual')
+    else:
+        is_conceptual = None  # Will be auto-detected in check_sources
+
+    # Track this generation run with metrics
+    with track_generation(topic, difficulty, question_type) as run_id:
+        # Initialize with empty DB template so we don't accidentally fallback
+        initial_state = {
+            "topic": topic,
+            "target_difficulty": difficulty,
+            "question_type": question_type,  # Pass question type to generation
+            "_run_id": run_id,  # For metrics tracking in nodes
+            "iteration_count": 0,
+            "revision_count": 0,
+            "verification_passed": False,
+            "use_fallback": False,
+            "is_conceptual": is_conceptual,  # Set based on question_type, or None for auto-detect
+            "code_draft": None,  # For code-first approach
+            "computed_result": None,  # Actual result from code execution
+            "question_data": {},
+            "source_urls": [],
+            "source_pages": [],
+            "source_filename": None,
+            "detected_keywords": {},  # Keywords detected in query for targeted context
+            "answer_mismatch": False,
+            "answer_validation_count": 0
+        }
+
+        result = graph.invoke(initial_state)
+
+        # We strictly return the generated data, never the raw DB template anymore
+        final_data = result.get('question_data', {})
+
+        if final_data:
+            final_data['source'] = result.get('source_type')
+            final_data['source_urls'] = result.get('source_urls', [])
+            final_data['source_pages'] = result.get('source_pages', [])
+            final_data['source_filename'] = result.get('source_filename', '')
+            if result.get('critique'):
+                final_data['quality_score'] = result['critique'].get('score', 0)
+
+            # Auto-tag the question
+            question_type = final_data.get('question_type', '')
+            final_data['tags'] = auto_tag_question(topic, question_type, difficulty)
+
+            # Note: Quality filtering happens in the graph via critic routing
+            # If we reach here with a low score, it means we exhausted retries
+            # Return it with the score so the user knows it's suboptimal
+        else:
+            final_data = {"error": "Failed to generate question."}
+
+    return final_data
+
+
+def run_agent_streaming(topic: str, difficulty: str = "Medium", question_type: str = None):
+    """
+    Generator version of run_agent that yields progress events.
+    Used for SSE streaming endpoint.
+
+    Yields dicts with:
+    - type: "progress" | "result" | "error"
+    - phase: current phase name
+    - message: human readable status
+    - data: (for result type) the final question data
+    """
+    graph = get_graph()  # Use cached graph
+    logger.info(f"[Streaming] Tribunal Engine Started for Topic: {topic}, Type: {question_type}")
+
+    # Determine if conceptual based on question_type (same logic as run_agent)
+    if question_type:
+        is_conceptual = question_type in ('short', 'long', 'mcq', 'theory', 'conceptual')
+    else:
+        is_conceptual = None  # Will be auto-detected in check_sources
+
+    initial_state = {
+        "topic": topic,
+        "target_difficulty": difficulty,
+        "question_type": question_type,
+        "iteration_count": 0,
+        "revision_count": 0,
+        "verification_passed": False,
+        "use_fallback": False,
+        "is_conceptual": is_conceptual,  # Set based on question_type, or None for auto-detect
+        "code_draft": None,
+        "computed_result": None,
+        "question_data": {},
+        "source_urls": [],
+        "source_pages": [],
+        "source_filename": None,
+        "detected_keywords": {},
+        "answer_mismatch": False,
+        "answer_validation_count": 0
+    }
+
+    # Phase descriptions for progress updates
+    phase_messages = {
+        "scout": "Searching PDF sources...",
+        "use_cache": "Found cached question, loading...",
+        "theory_author": "Generating theory-based question...",
+        "code_author": "Generating verification code...",
+        "executor": "Executing code to compute answer...",
+        "question_author": "Writing question text...",
+        "reviewer": "Reviewing quality...",
+        "fallback": "Using fallback generation...",
+        "archivist": "Saving result..."
+    }
+
+    yield {"type": "progress", "phase": "start", "message": f"Starting generation for: {topic}", "topic": topic, "difficulty": difficulty}
+
+    try:
+        # Stream through graph execution, accumulate state
+        accumulated_state = dict(initial_state)
+
+        for event in graph.stream(initial_state):
+            # event is a dict with node name -> output
+            for node_name, output in event.items():
+                # Update accumulated state
+                accumulated_state.update(output)
+
+                message = phase_messages.get(node_name, f"Processing {node_name}...")
+
+                # Build detailed progress event
+                progress_event = {
+                    "type": "progress",
+                    "phase": node_name,
+                    "message": message
+                }
+
+                # Add source info after scout phase
+                if node_name == "scout":
+                    if output.get('source_filename'):
+                        progress_event["source_file"] = output['source_filename']
+                    if output.get('source_pages'):
+                        progress_event["source_pages"] = output['source_pages']
+                    if output.get('cached_question'):
+                        progress_event["cache_hit"] = True
+                        progress_event["message"] = "Found similar question in cache!"
+
+                # Add preview after question generation
+                if node_name in ["question_author", "theory_author", "fallback"]:
+                    q_data = output.get('question_data', {})
+                    if q_data and q_data.get('question'):
+                        # Provide preview of first 200 chars
+                        preview = q_data['question'][:200] + "..." if len(q_data.get('question', '')) > 200 else q_data.get('question', '')
+                        progress_event["preview"] = preview
+                        progress_event["message"] = "Question generated! Reviewing..."
+
+                # Add quality info after review
+                if node_name == "reviewer":
+                    critique = output.get('critique', {})
+                    if critique:
+                        progress_event["quality_score"] = critique.get('score', 0)
+                        progress_event["message"] = f"Quality review: {critique.get('score', '?')}/10"
+
+                yield progress_event
+
+                # Check for errors
+                if output.get('use_fallback') and node_name != "scout":
+                    yield {"type": "progress", "phase": node_name, "message": "Retrying with fallback..."}
+
+                # Check for retries
+                if output.get('verification_error'):
+                    yield {"type": "progress", "phase": node_name, "message": f"Retry: {output['verification_error'][:100]}..."}
+
+        # Build final result from accumulated state
+        final_data = accumulated_state.get('question_data', {})
+        if final_data and 'question' in final_data:
+            final_data['source'] = accumulated_state.get('source_type')
+            final_data['source_urls'] = accumulated_state.get('source_urls', [])
+            final_data['source_pages'] = accumulated_state.get('source_pages', [])
+            final_data['source_filename'] = accumulated_state.get('source_filename', '')
+            if accumulated_state.get('critique'):
+                final_data['quality_score'] = accumulated_state['critique'].get('score', 0)
+
+            # Auto-tag the question
+            question_type = final_data.get('question_type', '')
+            final_data['tags'] = auto_tag_question(topic, question_type, difficulty)
+
+            yield {"type": "result", "phase": "complete", "message": "Generation complete", "data": final_data}
+        else:
+            yield {"type": "error", "phase": "complete", "message": "Failed to generate question", "data": {"error": "Generation failed"}}
+
+    except Exception as e:
+        logger.error(f"[Streaming] Error: {e}")
+        yield {"type": "error", "phase": "error", "message": str(e), "data": {"error": str(e)}}
