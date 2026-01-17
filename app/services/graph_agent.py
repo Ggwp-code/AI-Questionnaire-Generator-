@@ -346,8 +346,114 @@ class AgentState(TypedDict):
     is_conceptual: bool  # True if topic is theory-based, skip code generation
     cached_question: Optional[Dict]  # Cached question from bank (skip generation if set)
     force_new: bool  # Force new generation even if cache exists
+    # BLOOM-ADAPTIVE RAG FIELDS (Step 2)
+    bloom_level: Optional[int]  # Bloom's taxonomy level 1-6
+    retrieved_chunk_ids: List[str]  # Chunk IDs retrieved for provenance
+    retrieved_doc_ids: List[str]  # Document IDs retrieved for provenance
+    # PEDAGOGY TAGGER FIELDS (Step 3)
+    course_outcome: Optional[str]  # CO1, CO2, etc.
+    program_outcome: Optional[str]  # PO1, PO2, etc.
 
 # --- NODES ---
+
+# --- BLOOM LEVEL DETECTION (STEP 2) ---
+
+class BloomAnalysis(BaseModel):
+    """Bloom's Taxonomy level detection"""
+    bloom_level: int = Field(description="Bloom's taxonomy level 1-6")
+    reasoning: str = Field(description="Brief explanation of classification")
+
+def detect_bloom_level(topic: str, question_type: str = None) -> int:
+    """
+    Detect Bloom's taxonomy level from topic and question type using LLM.
+
+    Bloom Levels:
+    1-2: Remember/Understand - Recall facts, definitions, concepts
+    3-4: Apply/Analyze - Use knowledge, break down problems
+    5-6: Evaluate/Create - Critique, design, synthesize
+    """
+    # Check if Bloom RAG is enabled
+    bloom_enabled = os.getenv("BLOOM_RAG_ENABLED", "true").lower() == "true"
+    if not bloom_enabled:
+        logger.info("[Bloom] BLOOM_RAG_ENABLED=false, using default level 3")
+        return 3  # Default middle level
+
+    logger.info(f"[Bloom Analyzer] Analyzing topic: '{topic}' (type={question_type})")
+
+    system_prompt = f"""You are an educational expert analyzing questions according to Bloom's Taxonomy.
+
+BLOOM'S TAXONOMY LEVELS:
+
+Level 1 - Remember: Recall facts, terms, basic concepts, definitions
+  Keywords: define, list, name, identify, recall, state, what is
+  Examples: "Define entropy", "What is Gini index", "List types of agents"
+
+Level 2 - Understand: Explain ideas, interpret, summarize, describe
+  Keywords: explain, describe, discuss, summarize, interpret, compare
+  Examples: "Explain how ID3 works", "Describe rational agents"
+
+Level 3 - Apply: Use information in new situations, implement, execute
+  Keywords: apply, implement, use, execute, solve, calculate (simple)
+  Examples: "Calculate entropy for dataset", "Apply Gini formula"
+
+Level 4 - Analyze: Draw connections, examine structure, differentiate
+  Keywords: analyze, examine, investigate, differentiate, compare complexity
+  Examples: "Analyze algorithm complexity", "Compare BFS vs DFS"
+
+Level 5 - Evaluate: Justify decisions, critique, assess, judge
+  Keywords: evaluate, critique, justify, assess, judge, defend
+  Examples: "Evaluate which algorithm is better", "Critique this approach"
+
+Level 6 - Create: Design, construct, plan, produce new solutions
+  Keywords: design, create, develop, formulate, construct, synthesize
+  Examples: "Design a decision tree", "Create a new algorithm"
+
+QUESTION TYPE HINTS:
+- MCQ: Usually levels 1-3 (recall, understand, simple application)
+- Short answer: Usually levels 1-3 (definitions, explanations)
+- Long answer: Usually levels 3-5 (application, analysis, evaluation)
+- Calculation/trace: Usually levels 3-4 (application, analysis)
+
+Analyze the following topic and classify it into the appropriate Bloom level (1-6).
+Topic: "{topic}"
+Question Type: {question_type or "unknown"}
+
+Be precise. Return the most appropriate single level based on what the topic is asking for."""
+
+    llm = get_llm(json_mode=BloomAnalysis, mode="instant")  # Use fast model for classification
+
+    try:
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content="Classify this topic's Bloom level.")
+        ])
+
+        bloom_level = response.bloom_level
+        reasoning = response.reasoning
+
+        # Validate range
+        if bloom_level < 1 or bloom_level > 6:
+            logger.warning(f"[Bloom] Invalid level {bloom_level}, defaulting to 3")
+            bloom_level = 3
+
+        logger.info(f"[Bloom Analyzer] ✓ Detected Level {bloom_level}: {reasoning}")
+        return bloom_level
+
+    except Exception as e:
+        logger.error(f"[Bloom] Detection failed: {e}, defaulting to level 3")
+        return 3  # Default to middle level on error
+
+@timed_node("bloom_analyzer")
+def analyze_bloom(state: AgentState) -> Dict:
+    """Analyze topic to determine Bloom's taxonomy level for adaptive RAG"""
+    topic = state['topic']
+    question_type = state.get('question_type')
+
+    bloom_level = detect_bloom_level(topic, question_type)
+
+    return {
+        'bloom_level': bloom_level
+    }
 
 @timed_node("scout")
 def check_sources(state: AgentState) -> Dict:
@@ -364,8 +470,13 @@ def check_sources(state: AgentState) -> Dict:
     pdf_result = None
     duplicate_result = None
 
+    # BLOOM-ADAPTIVE RAG: Get bloom_level from state (set by analyze_bloom node)
+    bloom_level = state.get('bloom_level')
+    logger.info(f"[Scout] Using Bloom level {bloom_level} for RAG retrieval")
+
     def search_pdf():
-        return rag.search_with_keywords(state['topic'], k=10)
+        # Pass bloom_level to enable adaptive k
+        return rag.search_with_keywords(state['topic'], bloom_level=bloom_level)
 
     def check_cache():
         if state['iteration_count'] == 0 and not state.get('force_new', False):
@@ -384,6 +495,11 @@ def check_sources(state: AgentState) -> Dict:
     source_pages = pages
     source_filename = filename
     detected_keywords = keyword_contexts
+
+    # PROVENANCE TRACKING (Step 2): Capture chunk and doc IDs
+    # For now, use page numbers as doc IDs (more detailed tracking can be added later)
+    retrieved_chunk_ids = [f"page_{p}_chunk" for p in pages]  # Placeholder
+    retrieved_doc_ids = [f"doc_{filename}_p{p}" for p in pages]
 
     # Log detected keywords
     if keyword_contexts:
@@ -404,7 +520,9 @@ def check_sources(state: AgentState) -> Dict:
             'source_filename': None,
             'detected_keywords': {},
             'db_template': None,
-            'use_fallback': True
+            'use_fallback': True,
+            'retrieved_chunk_ids': [],
+            'retrieved_doc_ids': []
         }
 
     # 2. Process duplicate check result
@@ -444,7 +562,10 @@ def check_sources(state: AgentState) -> Dict:
         'detected_keywords': detected_keywords,
         'db_template': None,
         'is_conceptual': topic_is_conceptual,
-        'cached_question': cached_question  # Will be used to skip generation if set
+        'cached_question': cached_question,  # Will be used to skip generation if set
+        # BLOOM-ADAPTIVE RAG PROVENANCE (Step 2)
+        'retrieved_chunk_ids': retrieved_chunk_ids,
+        'retrieved_doc_ids': retrieved_doc_ids
     }
 
 @timed_node("theory_author")
@@ -1426,6 +1547,100 @@ def use_cached_question(state: AgentState) -> Dict:
     }
 
 
+# --- PEDAGOGY TAGGER (STEP 3) ---
+
+class PedagogyTags(BaseModel):
+    """Educational metadata tags"""
+    course_outcome: str = Field(description="Course outcome (CO1, CO2, etc.)")
+    program_outcome: str = Field(description="Program outcome (PO1, PO2, etc.)")
+    reasoning: str = Field(description="Brief reasoning for the tags")
+
+@timed_node("pedagogy_tagger")
+def tag_pedagogy(state: AgentState) -> Dict:
+    """
+    Tag question with educational metadata (Course Outcome, Program Outcome).
+    OPTIONAL node - controlled by ENABLE_PEDAGOGY_TAGGER env variable.
+    """
+    # Check if pedagogy tagger is enabled
+    tagger_enabled = os.getenv("ENABLE_PEDAGOGY_TAGGER", "false").lower() == "true"
+    if not tagger_enabled:
+        logger.info("[Pedagogy Tagger] DISABLED (ENABLE_PEDAGOGY_TAGGER=false)")
+        return {}  # Skip tagging
+
+    logger.info("[Pedagogy Tagger] Tagging question with CO/PO...")
+
+    question_data = state.get('question_data', {})
+    question_text = question_data.get('question', '')
+    bloom_level = state.get('bloom_level', 3)
+    topic = state.get('topic', '')
+
+    if not question_text:
+        logger.warning("[Pedagogy Tagger] No question text found, skipping")
+        return {}
+
+    # Rule-based + LLM hybrid approach
+    system_prompt = f"""You are an educational assessment expert tagging questions with curriculum outcomes.
+
+QUESTION:
+{question_text[:1000]}
+
+TOPIC: {topic}
+BLOOM LEVEL: {bloom_level}
+
+TAG this question with appropriate educational outcomes:
+
+COURSE OUTCOMES (CO):
+- CO1: Remember and understand fundamental concepts
+- CO2: Apply knowledge to solve problems
+- CO3: Analyze and evaluate complex scenarios
+- CO4: Design and create solutions
+- CO5: Communicate and work collaboratively
+
+PROGRAM OUTCOMES (PO):
+- PO1: Engineering knowledge and problem-solving
+- PO2: Critical thinking and analysis
+- PO3: Design and development of solutions
+- PO4: Research and investigation
+- PO5: Modern tool usage
+- PO6: Communication skills
+
+RULES:
+1. Choose the MOST APPROPRIATE single CO and PO
+2. Base selection on Bloom level and question type
+3. If uncertain, choose the most likely option
+4. Keep reasoning brief (1 sentence)
+
+Return structured JSON with: course_outcome, program_outcome, reasoning"""
+
+    llm = get_llm(json_mode=PedagogyTags, mode="instant")  # Fast model for tagging
+
+    try:
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content="Tag this question.")
+        ])
+
+        co = response.course_outcome
+        po = response.program_outcome
+        reasoning = response.reasoning
+
+        logger.info(f"[Pedagogy Tagger] ✓ Tagged: {co}, {po} - {reasoning}")
+
+        return {
+            'course_outcome': co,
+            'program_outcome': po
+        }
+
+    except Exception as e:
+        logger.error(f"[Pedagogy Tagger] Tagging failed: {e}")
+        # Default fallback based on bloom level
+        if bloom_level <= 2:
+            return {'course_outcome': 'CO1', 'program_outcome': 'PO1'}
+        elif bloom_level <= 4:
+            return {'course_outcome': 'CO2', 'program_outcome': 'PO1'}
+        else:
+            return {'course_outcome': 'CO3', 'program_outcome': 'PO2'}
+
 @timed_node("archivist")
 def save_result(state: AgentState) -> Dict:
     if not state.get('verification_passed'): return {}
@@ -1452,6 +1667,9 @@ def build_graph():
     # TWO-PASS PIPELINE: Code-First Architecture with PARALLEL REVIEW
     # NEW: Theory path for conceptual topics (no code needed)
     # NEW: Cache path for duplicate detection
+    # STEP 2: Bloom Analyzer for adaptive RAG
+    # STEP 3: Pedagogy Tagger for educational metadata
+    workflow.add_node("bloom_analyzer", analyze_bloom)  # STEP 2: First node - detect Bloom level
     workflow.add_node("scout", check_sources)
     workflow.add_node("use_cache", use_cached_question)  # NEW: Use cached question
     workflow.add_node("theory_author", generate_theory_question)  # For conceptual topics
@@ -1459,10 +1677,15 @@ def build_graph():
     workflow.add_node("executor", execute_code)
     workflow.add_node("question_author", generate_question_from_result)
     workflow.add_node("reviewer", parallel_review)  # PARALLEL: runs critic + validator together
+    workflow.add_node("pedagogy_tagger", tag_pedagogy)  # STEP 3: Tag with CO/PO after review
     workflow.add_node("fallback", use_fallback)
     workflow.add_node("archivist", save_result)
 
-    workflow.set_entry_point("scout")
+    # STEP 2: Start with Bloom analyzer (detects level for adaptive RAG)
+    workflow.set_entry_point("bloom_analyzer")
+
+    # Bloom Analyzer -> Scout (always)
+    workflow.add_edge("bloom_analyzer", "scout")
 
     # 1. Scout -> Route based on cache hit or topic type
     def route_after_scout(state):
@@ -1512,7 +1735,7 @@ def build_graph():
         {"fallback": "fallback", "reviewer": "reviewer"}
     )
 
-    # 5. Parallel Review -> Save (or Retry if failed)
+    # 5. Parallel Review -> Pedagogy Tagger (optional) or Save (or Retry if failed)
     def route_after_review(state):
         if state.get('use_fallback'):
             return "fallback"
@@ -1529,13 +1752,21 @@ def build_graph():
         if state.get('answer_mismatch'):
             return "retry"
 
-        return "save"
+        # STEP 3: Route through pedagogy_tagger if enabled, otherwise go to save
+        tagger_enabled = os.getenv("ENABLE_PEDAGOGY_TAGGER", "false").lower() == "true"
+        if tagger_enabled:
+            return "tag"
+        else:
+            return "save"
 
     workflow.add_conditional_edges(
         "reviewer",
         route_after_review,
-        {"fallback": "fallback", "retry": "code_author", "save": "archivist"}
+        {"fallback": "fallback", "retry": "code_author", "tag": "pedagogy_tagger", "save": "archivist"}
     )
+
+    # STEP 3: Pedagogy Tagger -> Archivist (always after tagging)
+    workflow.add_edge("pedagogy_tagger", "archivist")
 
     workflow.add_edge("fallback", "archivist")
     workflow.add_edge("archivist", END)
@@ -1614,7 +1845,14 @@ def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None)
             "source_filename": None,
             "detected_keywords": {},  # Keywords detected in query for targeted context
             "answer_mismatch": False,
-            "answer_validation_count": 0
+            "answer_validation_count": 0,
+            # STEP 2: Bloom-Adaptive RAG initialization
+            "bloom_level": None,  # Will be set by analyze_bloom node
+            "retrieved_chunk_ids": [],
+            "retrieved_doc_ids": [],
+            # STEP 3: Pedagogy Tagger initialization
+            "course_outcome": None,
+            "program_outcome": None
         }
 
         result = graph.invoke(initial_state)
@@ -1629,6 +1867,15 @@ def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None)
             final_data['source_filename'] = result.get('source_filename', '')
             if result.get('critique'):
                 final_data['quality_score'] = result['critique'].get('score', 0)
+
+            # STEP 2: Add Bloom-Adaptive RAG provenance
+            final_data['bloom_level'] = result.get('bloom_level')
+            final_data['retrieved_chunk_ids'] = result.get('retrieved_chunk_ids', [])
+            final_data['retrieved_doc_ids'] = result.get('retrieved_doc_ids', [])
+
+            # STEP 3: Add Pedagogy tags
+            final_data['course_outcome'] = result.get('course_outcome')
+            final_data['program_outcome'] = result.get('program_outcome')
 
             # Auto-tag the question
             question_type = final_data.get('question_type', '')
@@ -1680,11 +1927,19 @@ def run_agent_streaming(topic: str, difficulty: str = "Medium", question_type: s
         "source_filename": None,
         "detected_keywords": {},
         "answer_mismatch": False,
-        "answer_validation_count": 0
+        "answer_validation_count": 0,
+        # STEP 2: Bloom-Adaptive RAG initialization
+        "bloom_level": None,
+        "retrieved_chunk_ids": [],
+        "retrieved_doc_ids": [],
+        # STEP 3: Pedagogy Tagger initialization
+        "course_outcome": None,
+        "program_outcome": None
     }
 
     # Phase descriptions for progress updates
     phase_messages = {
+        "bloom_analyzer": "Analyzing Bloom's taxonomy level...",  # STEP 2
         "scout": "Searching PDF sources...",
         "use_cache": "Found cached question, loading...",
         "theory_author": "Generating theory-based question...",
@@ -1692,6 +1947,7 @@ def run_agent_streaming(topic: str, difficulty: str = "Medium", question_type: s
         "executor": "Executing code to compute answer...",
         "question_author": "Writing question text...",
         "reviewer": "Reviewing quality...",
+        "pedagogy_tagger": "Tagging with educational outcomes...",  # STEP 3
         "fallback": "Using fallback generation...",
         "archivist": "Saving result..."
     }
@@ -1762,6 +2018,15 @@ def run_agent_streaming(topic: str, difficulty: str = "Medium", question_type: s
             final_data['source_filename'] = accumulated_state.get('source_filename', '')
             if accumulated_state.get('critique'):
                 final_data['quality_score'] = accumulated_state['critique'].get('score', 0)
+
+            # STEP 2: Add Bloom-Adaptive RAG provenance
+            final_data['bloom_level'] = accumulated_state.get('bloom_level')
+            final_data['retrieved_chunk_ids'] = accumulated_state.get('retrieved_chunk_ids', [])
+            final_data['retrieved_doc_ids'] = accumulated_state.get('retrieved_doc_ids', [])
+
+            # STEP 3: Add Pedagogy tags
+            final_data['course_outcome'] = accumulated_state.get('course_outcome')
+            final_data['program_outcome'] = accumulated_state.get('program_outcome')
 
             # Auto-tag the question
             question_type = final_data.get('question_type', '')
