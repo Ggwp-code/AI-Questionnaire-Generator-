@@ -1,1 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tribunal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=Space+Grotesk:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['DM Sans', 'sans-serif'],
+              display: ['Space Grotesk', 'sans-serif'],
+            },
+            colors: {
+              paper: '#fffcf9',
+              surface: '#ffffff',
+              ink: {
+                DEFAULT: '#4a3b32',
+                light: '#8c7e75',
+                faint: '#d1cdc9'
+              },
+              accent: {
+                DEFAULT: '#ea580c', // Orange 600
+                hover: '#c2410c',
+                soft: '#ffedd5', // Orange 100
+                glow: 'rgba(234, 88, 12, 0.15)'
+              },
+              warm: {
+                50: '#fff7ed',
+                100: '#ffedd5',
+                200: '#fed7aa',
+                300: '#fdba74',
+                border: '#f5efe9'
+              }
+            },
+            animation: {
+              'fade-in': 'fadeIn 0.5s ease-out',
+              'slide-up': 'slideUp 0.5s ease-out',
+            },
+            keyframes: {
+              fadeIn: {
+                '0%': { opacity: '0' },
+                '100%': { opacity: '1' },
+              },
+              slideUp: {
+                '0%': { transform: 'translateY(10px)', opacity: '0' },
+                '100%': { transform: 'translateY(0)', opacity: '1' },
+              }
+            }
+          },
+        },
+      }
+    </script>
+    <style>
+      body {
+        background-color: #fff8f3; /* warm background */
+        background-image: radial-gradient(at 0% 0%, rgba(254, 215, 170, 0.3) 0px, transparent 50%),
+                          radial-gradient(at 100% 100%, rgba(254, 215, 170, 0.3) 0px, transparent 50%);
+        background-attachment: fixed;
+        color: #4a3b32;
+        -webkit-font-smoothing: antialiased;
+      }
+      ::-webkit-scrollbar {
+        width: 6px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent; 
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #e7e5e4; 
+        border-radius: 10px;
+      }
+    </style>
 
+<link rel="stylesheet" href="/index.css">
+  <script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react/": "https://esm.sh/react@18.3.1/",
+    "lucide-react": "https://esm.sh/lucide-react@0.378.0",
+    "react-dom": "https://esm.sh/react-dom@18.3.1",
+    "react-dom/": "https://esm.sh/react-dom@18.3.1/"
+  }
+}
+</script>
+  <script type="module" crossorigin src="/assets/index-DfFZoE0e.js"></script>
+</head>
+  <body>
+    <div id="root"></div>
+    <script>
+      window.onerror = function(message, source, lineno, colno, error) {
+        const root = document.getElementById('root');
+        if (root && root.innerHTML === '') {
+          root.innerHTML = `
+            <div style="padding: 2rem; color: #ef4444; font-family: sans-serif;">
+              <h2 style="font-size: 1.5rem; margin-bottom: 1rem;">Application Error</h2>
+              <p>${message}</p>
+            </div>
+          `;
+        }
+      };
+    </script>
+</body>
+</html>
