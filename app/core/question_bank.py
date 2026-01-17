@@ -44,9 +44,16 @@ def init_db():
             'answer_text': 'TEXT',
             'explanation_text': 'TEXT',
             'source_urls': 'TEXT',
-            'full_json': 'TEXT'
+            'full_json': 'TEXT',
+            # STEP 2: Bloom-Adaptive RAG columns
+            'bloom_level': 'INTEGER',
+            'retrieved_chunk_ids': 'TEXT',
+            'retrieved_doc_ids': 'TEXT',
+            # STEP 3: Pedagogy Tagger columns
+            'course_outcome': 'TEXT',
+            'program_outcome': 'TEXT'
         }
-        
+
         for col_name, col_type in required_columns.items():
             if col_name not in existing_columns:
                 print(f"🔧 Migrating Database: Adding missing column '{col_name}'...")
@@ -65,13 +72,22 @@ def save_template(topic: str, difficulty: str, question_text: str, code: str, so
     json_str = json.dumps(full_data) if full_data else '{}'
     urls_str = json.dumps(source_urls) if source_urls else '[]'
 
+    # STEP 2 & 3: Extract new fields from full_data
+    bloom_level = full_data.get('bloom_level') if full_data else None
+    chunk_ids_str = json.dumps(full_data.get('retrieved_chunk_ids', [])) if full_data else '[]'
+    doc_ids_str = json.dumps(full_data.get('retrieved_doc_ids', [])) if full_data else '[]'
+    course_outcome = full_data.get('course_outcome') if full_data else None
+    program_outcome = full_data.get('program_outcome') if full_data else None
+
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
             """INSERT INTO templates
-               (topic, difficulty, question_text, answer_text, explanation_text, verification_code, source_type, source_urls, full_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (topic.lower(), difficulty, question_text, answer, explanation, code, source, urls_str, json_str, time.time())
+               (topic, difficulty, question_text, answer_text, explanation_text, verification_code, source_type, source_urls, full_json, created_at,
+                bloom_level, retrieved_chunk_ids, retrieved_doc_ids, course_outcome, program_outcome)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (topic.lower(), difficulty, question_text, answer, explanation, code, source, urls_str, json_str, time.time(),
+             bloom_level, chunk_ids_str, doc_ids_str, course_outcome, program_outcome)
         )
         conn.commit()
 

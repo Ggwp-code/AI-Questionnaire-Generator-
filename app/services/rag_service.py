@@ -1,6 +1,7 @@
 """
 Module: app/services/rag_service.py
 Purpose: RAG Service with lazy loading and caching for fast repeated queries.
+EXTENDED: Bloom-Adaptive RAG (Step 2) - Dynamically adjust k based on Bloom level
 """
 import os
 import re
@@ -15,6 +16,42 @@ from app.rag import get_rag_engine
 from app.tools.utils import get_logger
 
 logger = get_logger("EnhancedRAGService")
+
+# ========== BLOOM-ADAPTIVE RAG (STEP 2) ==========
+
+def bloom_to_k(bloom_level: int) -> int:
+    """
+    Map Bloom's taxonomy level to number of chunks to retrieve.
+
+    Bloom Level    Chunks (k)   Rationale
+    -----------    ----------   ---------
+    1-2            3-5          Simple recall/understanding needs fewer sources
+    3-4            6-10         Application/analysis needs moderate context
+    5-6            12-15        Evaluation/creation needs comprehensive context
+
+    Can be overridden via env vars:
+    - BLOOM_K_LOW (default: 4)
+    - BLOOM_K_MED (default: 8)
+    - BLOOM_K_HIGH (default: 13)
+    """
+    # Get config from environment with defaults
+    k_low = int(os.getenv("BLOOM_K_LOW", "4"))    # 3-5 range, use middle
+    k_med = int(os.getenv("BLOOM_K_MED", "8"))    # 6-10 range, use middle
+    k_high = int(os.getenv("BLOOM_K_HIGH", "13"))  # 12-15 range, use middle
+
+    if bloom_level is None:
+        logger.warning("[Bloom RAG] bloom_level is None, using medium k")
+        return k_med
+
+    if bloom_level <= 2:
+        logger.info(f"[Bloom RAG] Level {bloom_level} (Remember/Understand) → k={k_low}")
+        return k_low
+    elif bloom_level <= 4:
+        logger.info(f"[Bloom RAG] Level {bloom_level} (Apply/Analyze) → k={k_med}")
+        return k_med
+    else:  # 5-6
+        logger.info(f"[Bloom RAG] Level {bloom_level} (Evaluate/Create) → k={k_high}")
+        return k_high
 
 
 # ========== RAG CACHE ==========
@@ -262,13 +299,26 @@ class HybridRetriever:
             self.logger.error(f"Reranking failed: {e}")
             return docs[:top_k]
 
-    def retrieve_with_keywords(self, query: str) -> Tuple[str, List[int], str, Dict[str, str]]:
+    def retrieve_with_keywords(self, query: str, bloom_level: int = None) -> Tuple[str, List[int], str, Dict[str, str]]:
         """
         Keyword-aware retrieval that searches for specific content types.
-        Returns (context, page_numbers, filename, keyword_contexts)
+        EXTENDED: Now uses Bloom level to adaptively set k (Step 2)
 
+        Args:
+            query: The search query
+            bloom_level: Bloom's taxonomy level (1-6) to determine k
+
+        Returns (context, page_numbers, filename, keyword_contexts)
         keyword_contexts maps detected keywords to their specific context snippets
         """
+        # BLOOM-ADAPTIVE RAG: Determine k based on bloom level
+        if bloom_level is not None:
+            adaptive_k = bloom_to_k(bloom_level)
+            self.logger.info(f"[Bloom RAG] Using adaptive k={adaptive_k} for bloom_level={bloom_level}")
+        else:
+            adaptive_k = 10  # Default if no bloom level
+            self.logger.info(f"[Bloom RAG] No bloom_level provided, using default k={adaptive_k}")
+
         # Extract content-type keywords and topic terms
         content_keywords = extract_keywords(query)
         topic_terms = extract_topic_terms(query)
@@ -293,11 +343,11 @@ class HybridRetriever:
             combined_query = f"{topic} {search_terms[0]}"  # Just first search term
             search_queries.append((keyword, combined_query))
 
-        # 2. Run all searches in PARALLEL
+        # 2. Run all searches in PARALLEL - use adaptive_k for primary search
         search_results = {}
         with ThreadPoolExecutor(max_workers=4) as executor:
             future_to_key = {
-                executor.submit(self._search_single, q, 10 if key == "primary" else 5): key
+                executor.submit(self._search_single, q, adaptive_k if key == "primary" else 5): key
                 for key, q in search_queries
             }
             for future in as_completed(future_to_key):
@@ -333,9 +383,10 @@ class HybridRetriever:
         if not all_docs:
             return "", [], "", {}
 
-        # 3. Rerank all collected docs against original query
+        # 3. Rerank all collected docs against original query - use adaptive final_k
         just_docs = [d for _, d in all_docs]
-        reranked = self._rerank_docs(query, just_docs, top_k=self.config.final_k)
+        final_k = adaptive_k if bloom_level is not None else self.config.final_k
+        reranked = self._rerank_docs(query, just_docs, top_k=final_k)
 
         # 4. Extract metadata
         pages: Set[int] = set()
@@ -390,12 +441,14 @@ class EnterpriseRAGService:
         """Returns (context, page_numbers, filename)"""
         return self.retriever.retrieve(query)
 
-    def search_with_keywords(self, query: str, k: int = 5) -> Tuple[str, List[int], str, Dict[str, str]]:
+    def search_with_keywords(self, query: str, k: int = 5, bloom_level: int = None) -> Tuple[str, List[int], str, Dict[str, str]]:
         """
         Returns (context, page_numbers, filename, keyword_contexts)
         keyword_contexts maps detected keywords (e.g., "pseudo-code") to relevant content
+
+        EXTENDED (Step 2): Now accepts bloom_level for adaptive k
         """
-        return self.retriever.retrieve_with_keywords(query)
+        return self.retriever.retrieve_with_keywords(query, bloom_level=bloom_level)
 
     def ingest_file(self, file_path: str):
         # Clear cache when new content is added
