@@ -2,10 +2,11 @@ import * as React from 'react';
 import { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { generateQuestion, getDocuments } from '../services/api';
-import { GenerationResponse, UploadedDocument } from '../types';
+import { generateQuestion, getDocuments, explainQuestion } from '../services/api';
+import { GenerationResponse, UploadedDocument, ProvenanceData } from '../types';
 import { Icons } from './ui/SystemIcons';
 import CodeViewer from './ui/CodeViewer';
+import ProvenanceModal from './ProvenanceModal';
 
 // Markdown component styles
 const markdownComponents = {
@@ -64,6 +65,12 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [documents, setDocuments] = useState<UploadedDocument[]>([]);
+
+  // Provenance Modal State (Step 4)
+  const [showProvenance, setShowProvenance] = useState(false);
+  const [provenanceData, setProvenanceData] = useState<ProvenanceData | null>(null);
+  const [provenanceLoading, setProvenanceLoading] = useState(false);
+  const [provenanceError, setProvenanceError] = useState<string | null>(null);
 
   // Fetch uploaded documents on mount
   useEffect(() => {
@@ -130,6 +137,28 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
       setLoading(false);
       setAbortController(null);
       setError("Generation cancelled.");
+    }
+  };
+
+  const handleExplain = async () => {
+    if (!data?.data?.question_id) {
+      setProvenanceError('Question ID not available. Question may not have been saved.');
+      setShowProvenance(true);
+      return;
+    }
+
+    setShowProvenance(true);
+    setProvenanceLoading(true);
+    setProvenanceError(null);
+    setProvenanceData(null);
+
+    try {
+      const provData = await explainQuestion(data.data.question_id);
+      setProvenanceData(provData);
+    } catch (err: any) {
+      setProvenanceError(err.message || 'Failed to load provenance data');
+    } finally {
+      setProvenanceLoading(false);
     }
   };
 
@@ -295,7 +324,7 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
             {/* Decorative top bar */}
             <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-accent via-orange-400 to-warm-300"></div>
 
-            {/* Header with Quality Score */}
+            {/* Header with Quality Score and Explain Button */}
             <div className="flex justify-between items-center border-b border-warm-100 pb-6 flex-wrap gap-3">
               <div className="flex items-center gap-3 flex-wrap">
                 <span className="bg-ink text-white px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider shadow-md shadow-ink/20">
@@ -305,6 +334,17 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
                   <span className={`text-xs font-bold px-3 py-1 rounded-full ${getQualityBg(data.data.quality_score)} ${getQualityColor(data.data.quality_score)} border ${data.data.quality_score >= 7 ? 'border-green-200' : 'border-red-200'}`}>
                     Quality: {data.data.quality_score}/10
                   </span>
+                )}
+                {/* STEP 4: Explain Button */}
+                {data.data.question_id && (
+                  <button
+                    onClick={handleExplain}
+                    className="flex items-center gap-2 px-3 py-1 bg-accent/10 hover:bg-accent/20 border border-accent/30 hover:border-accent rounded-full text-xs font-medium text-accent transition-all"
+                    title="View provenance and source documents"
+                  >
+                    <Icons.Book className="w-3 h-3" />
+                    Explain
+                  </button>
                 )}
               </div>
               <span className="text-xs font-mono text-ink-faint flex items-center gap-1">
@@ -431,6 +471,15 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
           </div>
         </div>
       )}
+
+      {/* STEP 4: Provenance Modal */}
+      <ProvenanceModal
+        isOpen={showProvenance}
+        onClose={() => setShowProvenance(false)}
+        data={provenanceData}
+        loading={provenanceLoading}
+        error={provenanceError}
+      />
     </div>
   );
 };

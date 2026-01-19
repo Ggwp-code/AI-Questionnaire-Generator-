@@ -64,7 +64,13 @@ def init_db():
 
         conn.commit()
 
-def save_template(topic: str, difficulty: str, question_text: str, code: str, source: str, full_data: Dict = None, source_urls: list = None):
+def save_template(topic: str, difficulty: str, question_text: str, code: str, source: str, full_data: Dict = None, source_urls: list = None) -> Optional[int]:
+    """
+    Save a question template to the database.
+
+    Returns:
+        The ID of the inserted question, or None if save failed
+    """
     init_db()
 
     answer = full_data.get('answer', '') if full_data else ''
@@ -89,7 +95,9 @@ def save_template(topic: str, difficulty: str, question_text: str, code: str, so
             (topic.lower(), difficulty, question_text, answer, explanation, code, source, urls_str, json_str, time.time(),
              bloom_level, chunk_ids_str, doc_ids_str, course_outcome, program_outcome)
         )
+        question_id = c.lastrowid
         conn.commit()
+        return question_id
 
 def get_existing_template(topic: str, difficulty: str) -> Optional[Dict[str, Any]]:
     init_db()
