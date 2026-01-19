@@ -3,6 +3,7 @@ import {
   Cpu,
   Upload,
   FileText,
+  File,
   Terminal,
   ShieldCheck,
   AlertTriangle,
@@ -34,7 +35,11 @@ import {
   Copy,
   Layers,
   ListOrdered,
-  Tag
+  Tag,
+  Target,
+  HelpCircle,
+  FileCheck,
+  Edit2
 } from 'lucide-react';
 
 export const Icons = {
@@ -42,6 +47,7 @@ export const Icons = {
   Cpu,
   Upload,
   FileText,
+  File,
   Terminal,
   ShieldCheck,
   AlertTriangle,
@@ -73,5 +79,9 @@ export const Icons = {
   Copy,
   Layers,
   ListOrdered,
-  Tag
+  Tag,
+  Target,
+  Question: HelpCircle,
+  Document: FileCheck,
+  Edit: Edit2
 };

@@ -1,19 +1,15 @@
 import React, { useState } from 'react';
 import IngestModule from './components/IngestModule';
 import GenerationModule from './components/GenerationModule';
-import HistoryModule, { HistoryItem } from './components/HistoryModule';
 import PaperGeneratorModule from './components/PaperGeneratorModule';
+import KnowledgeHubModule from './components/KnowledgeHubModule';
+import QuestionBankModule from './components/QuestionBankModule';
 import { GenerationResponse } from './types';
 
-type Tab = 'generate' | 'papers' | 'history' | 'ingest';
+type Tab = 'generate' | 'papers' | 'ingest' | 'knowledge' | 'question-bank';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('generate');
-
-  // History State
-  const [history, setHistory] = useState<HistoryItem[]>([]);
-  // State to pass data back to GenerationModule when restoring from history
-  const [restoreData, setRestoreData] = useState<GenerationResponse | null>(null);
 
   const handleIngestSuccess = (_topic: string) => {
     // After ingestion, optionally navigate back to generate tab
@@ -21,20 +17,7 @@ const App: React.FC = () => {
   };
 
   const handleGenerationComplete = (data: GenerationResponse) => {
-    const newItem: HistoryItem = {
-      id: Date.now().toString(),
-      timestamp: Date.now(),
-      data: data
-    };
-    setHistory(prev => [newItem, ...prev]);
-  };
-
-  const handleRestoreHistory = (data: GenerationResponse) => {
-    setRestoreData(data);
-    setActiveTab('generate');
-    // We clear restoreData after a short delay so it doesn't persist forever if the user manually changes the generation
-    // or just let GenerationModule handle it via useEffect. 
-    // Actually, keeping it in state is fine, GenerationModule will sync to it.
+    // Questions are now saved in QuestionBankModule automatically
   };
 
   return (
@@ -65,14 +48,19 @@ const App: React.FC = () => {
               label="Papers"
             />
             <TabButton
-              active={activeTab === 'history'}
-              onClick={() => setActiveTab('history')}
-              label={`History ${history.length > 0 ? `(${history.length})` : ''}`}
+              active={activeTab === 'question-bank'}
+              onClick={() => setActiveTab('question-bank')}
+              label="Question Bank"
+            />
+            <TabButton
+              active={activeTab === 'knowledge'}
+              onClick={() => setActiveTab('knowledge')}
+              label="Knowledge Hub"
             />
             <TabButton
               active={activeTab === 'ingest'}
               onClick={() => setActiveTab('ingest')}
-              label="Knowledge"
+              label="Upload"
             />
           </nav>
         </div>
@@ -83,7 +71,6 @@ const App: React.FC = () => {
         {activeTab === 'generate' && (
           <GenerationModule
             onGenerationComplete={handleGenerationComplete}
-            restoreData={restoreData}
             onNavigateToIngest={() => setActiveTab('ingest')}
           />
         )}
@@ -93,14 +80,14 @@ const App: React.FC = () => {
             onNavigateToIngest={() => setActiveTab('ingest')}
           />
         </div>
-        {activeTab === 'history' && (
-          <HistoryModule
-            history={history}
-            onRestore={handleRestoreHistory}
-          />
-        )}
         {activeTab === 'ingest' && (
           <IngestModule onIngest={handleIngestSuccess} />
+        )}
+        {activeTab === 'knowledge' && (
+          <KnowledgeHubModule />
+        )}
+        {activeTab === 'question-bank' && (
+          <QuestionBankModule />
         )}
       </main>
 

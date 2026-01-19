@@ -204,6 +204,7 @@ class RAGEngine:
         self.registry = DocumentRegistry()
         self.pdf_processor = PDFProcessor()
         self.vector_store = VectorStore()
+        self.logger = get_logger("RAGEngine")
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_config.chunk_size,
             chunk_overlap=self.chunk_config.chunk_overlap,
@@ -248,6 +249,41 @@ class RAGEngine:
         except Exception as e:
             self.logger.error(f"Query failed: {e}")
             return RetrievalResult("", [], [], topic)
+    
+    def query_by_pdf(self, pdf_filename: str, k: int = 20) -> RetrievalResult:
+        """Query chunks specifically from a given PDF file"""
+        try:
+            db = self.vector_store.get_database()
+            if not db:
+                return RetrievalResult("", [], [], f"content from {pdf_filename}")
+            
+            # Query with generic terms to get a large set of documents
+            # Then filter by source filename from metadata
+            all_docs = db.similarity_search("artificial intelligence machine learning", k=150)
+            
+            # Filter to only docs from this PDF
+            matching_docs = []
+            for doc in all_docs:
+                if 'source' in doc.metadata:
+                    # Check if filename matches (handle both full paths and just filenames)
+                    source = doc.metadata['source']
+                    source_basename = os.path.basename(source)
+                    if pdf_filename == source_basename or pdf_filename in source:
+                        matching_docs.append(doc)
+                        if len(matching_docs) >= k:
+                            break
+            
+            if not matching_docs:
+                self.logger.warning(f"No chunks found for PDF: {pdf_filename}")
+                return RetrievalResult("", [], [], f"content from {pdf_filename}")
+            
+            context = "\n\n".join([d.page_content for d in matching_docs])
+            self.logger.info(f"Retrieved {len(matching_docs)} chunks ({len(context)} chars) from {pdf_filename}")
+            
+            return RetrievalResult(context, matching_docs, [], f"content from {pdf_filename}", num_sources=len(matching_docs))
+        except Exception as e:
+            self.logger.error(f"Query by PDF failed for {pdf_filename}: {e}")
+            return RetrievalResult("", [], [], f"content from {pdf_filename}")
 
     def get_statistics(self) -> Dict:
         return {

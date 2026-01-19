@@ -64,20 +64,181 @@
         background-attachment: fixed;
         color: #4a3b32;
         -webkit-font-smoothing: antialiased;
+        overflow-x: hidden;
       }
       ::-webkit-scrollbar {
         width: 6px;
       }
       ::-webkit-scrollbar-track {
-        background: transparent; 
+        background: transparent;
       }
       ::-webkit-scrollbar-thumb {
-        background: #e7e5e4; 
+        background: #e7e5e4;
         border-radius: 10px;
+      }
+
+      /* Heartbeat pulse grid */
+      .pulse-grid {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 0;
+        overflow: hidden;
+      }
+
+      /* Horizontal pulse lines */
+      .pulse-line {
+        position: absolute;
+        left: 0;
+        width: 100%;
+        height: 1px;
+        background: rgba(234, 88, 12, 0.06);
+      }
+      .pulse-line::after {
+        content: '';
+        position: absolute;
+        left: -100%;
+        width: 200px;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(234, 88, 12, 0.25), transparent);
+        animation: pulse-sweep 8s ease-in-out infinite;
+      }
+      .pulse-line:nth-child(1) { top: 20%; }
+      .pulse-line:nth-child(1)::after { animation-delay: 0s; }
+      .pulse-line:nth-child(2) { top: 40%; }
+      .pulse-line:nth-child(2)::after { animation-delay: 1s; }
+      .pulse-line:nth-child(3) { top: 60%; }
+      .pulse-line:nth-child(3)::after { animation-delay: 2s; }
+      .pulse-line:nth-child(4) { top: 80%; }
+      .pulse-line:nth-child(4)::after { animation-delay: 3s; }
+
+      /* Vertical pulse lines */
+      .pulse-line-v {
+        position: absolute;
+        top: 0;
+        height: 100%;
+        width: 1px;
+        background: rgba(234, 88, 12, 0.06);
+      }
+      .pulse-line-v::after {
+        content: '';
+        position: absolute;
+        top: -100%;
+        width: 100%;
+        height: 200px;
+        background: linear-gradient(180deg, transparent, rgba(234, 88, 12, 0.25), transparent);
+        animation: pulse-sweep-v 10s ease-in-out infinite;
+      }
+      .pulse-line-v:nth-child(5) { left: 25%; }
+      .pulse-line-v:nth-child(5)::after { animation-delay: 0.5s; }
+      .pulse-line-v:nth-child(6) { left: 50%; }
+      .pulse-line-v:nth-child(6)::after { animation-delay: 2s; }
+      .pulse-line-v:nth-child(7) { left: 75%; }
+      .pulse-line-v:nth-child(7)::after { animation-delay: 3.5s; }
+
+      @keyframes pulse-sweep {
+        0% { left: -200px; }
+        100% { left: 100%; }
+      }
+      @keyframes pulse-sweep-v {
+        0% { top: -200px; }
+        100% { top: 100%; }
+      }
+
+      /* Corner intersections - pulse dots */
+      .pulse-dot {
+        position: absolute;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: rgba(234, 88, 12, 0.15);
+        animation: dot-pulse 4s ease-in-out infinite;
+      }
+      .pulse-dot:nth-child(8) { top: 20%; left: 25%; animation-delay: 0s; }
+      .pulse-dot:nth-child(9) { top: 20%; left: 50%; animation-delay: 0.5s; }
+      .pulse-dot:nth-child(10) { top: 20%; left: 75%; animation-delay: 1s; }
+      .pulse-dot:nth-child(11) { top: 40%; left: 25%; animation-delay: 0.3s; }
+      .pulse-dot:nth-child(12) { top: 40%; left: 50%; animation-delay: 0.8s; }
+      .pulse-dot:nth-child(13) { top: 40%; left: 75%; animation-delay: 1.3s; }
+      .pulse-dot:nth-child(14) { top: 60%; left: 25%; animation-delay: 0.6s; }
+      .pulse-dot:nth-child(15) { top: 60%; left: 50%; animation-delay: 1.1s; }
+      .pulse-dot:nth-child(16) { top: 60%; left: 75%; animation-delay: 1.6s; }
+      .pulse-dot:nth-child(17) { top: 80%; left: 25%; animation-delay: 0.9s; }
+      .pulse-dot:nth-child(18) { top: 80%; left: 50%; animation-delay: 1.4s; }
+      .pulse-dot:nth-child(19) { top: 80%; left: 75%; animation-delay: 1.9s; }
+
+      @keyframes dot-pulse {
+        0%, 100% {
+          transform: scale(1);
+          opacity: 0.15;
+        }
+        50% {
+          transform: scale(1.8);
+          opacity: 0.4;
+        }
+      }
+
+      /* Subtle pulse ring on hover for cards */
+      .hover-pulse {
+        position: relative;
+      }
+      .hover-pulse::before {
+        content: '';
+        position: absolute;
+        inset: -2px;
+        border-radius: inherit;
+        background: transparent;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+      .hover-pulse:hover::before {
+        animation: pulse-ring 1.5s ease-out infinite;
+        opacity: 1;
+      }
+      @keyframes pulse-ring {
+        0% {
+          box-shadow: 0 0 0 0 rgba(234, 88, 12, 0.4);
+        }
+        70% {
+          box-shadow: 0 0 0 10px rgba(234, 88, 12, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(234, 88, 12, 0);
+        }
+      }
+
+      /* Shimmer loading effect */
+      .shimmer {
+        background: linear-gradient(90deg, #f5f5f5 25%, #e8e8e8 50%, #f5f5f5 75%);
+        background-size: 200% 100%;
+        animation: shimmer 1.5s infinite;
+      }
+      @keyframes shimmer {
+        0% { background-position: 200% 0; }
+        100% { background-position: -200% 0; }
+      }
+
+      /* Bounce animation for icons */
+      .bounce-subtle {
+        animation: bounce-subtle 2s ease-in-out infinite;
+      }
+      @keyframes bounce-subtle {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-3px); }
+      }
+
+      /* Rotate animation */
+      .spin-slow {
+        animation: spin-slow 8s linear infinite;
+      }
+      @keyframes spin-slow {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
       }
     </style>
 
 <link rel="stylesheet" href="/index.css">
+<link href="https://cdn.jsdelivr.net/npm/flowbite@2.5.2/dist/flowbite.min.css" rel="stylesheet" />
   <script type="importmap">
 {
   "imports": {
@@ -89,10 +250,35 @@
   }
 }
 </script>
-  <script type="module" crossorigin src="/assets/index-DfFZoE0e.js"></script>
+  <script type="module" crossorigin src="/assets/index-Cu8REPP1.js"></script>
 </head>
   <body>
-    <div id="root"></div>
+    <!-- Heartbeat pulse grid background -->
+    <div class="pulse-grid">
+      <!-- Horizontal pulse lines -->
+      <div class="pulse-line"></div>
+      <div class="pulse-line"></div>
+      <div class="pulse-line"></div>
+      <div class="pulse-line"></div>
+      <!-- Vertical pulse lines -->
+      <div class="pulse-line-v"></div>
+      <div class="pulse-line-v"></div>
+      <div class="pulse-line-v"></div>
+      <!-- Intersection dots -->
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+      <div class="pulse-dot"></div>
+    </div>
+    <div id="root" class="relative z-10"></div>
     <script>
       window.onerror = function(message, source, lineno, colno, error) {
         const root = document.getElementById('root');
@@ -105,6 +291,6 @@
           `;
         }
       };
-    </script>
+    </script>
 </body>
 </html>

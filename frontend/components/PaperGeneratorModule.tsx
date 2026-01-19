@@ -9,6 +9,7 @@ import {
   exportPaper,
   getAnswerKey,
   getSuggestions,
+  getSuggestionsByPDF,
   streamPaperGeneration,
   PaperStreamEvent,
   getPaperRubric,
@@ -16,6 +17,8 @@ import {
   getMetrics,
   resetMetrics,
   reloadConfig,
+  deletePaper,
+  updatePaperTitle,
   Analytics,
   Metrics,
   PaperRubric,
@@ -28,8 +31,10 @@ import {
   QuestionSpec,
   GeneratedPaper,
   GeneratedQuestion,
-  TopicSuggestion
+  TopicSuggestion,
+  PDFSuggestion
 } from '../types';
+import paperFormats from '../config/paperFormats.json';
 
 const DIFFICULTIES = ['Easy', 'Medium', 'Hard'] as const;
 const QUESTION_TYPES = [
@@ -38,6 +43,27 @@ const QUESTION_TYPES = [
   { value: 'mcq', label: 'Multiple Choice', marks: 1 },
   { value: 'numerical', label: 'Numerical', marks: 3 },
 ] as const;
+
+type ExamType = 'CIE' | 'SEE';
+
+type FormatConfig = {
+  exam_formats?: Record<string, {
+    title?: string;
+    duration_minutes?: number;
+    instructions?: string[];
+    sections?: Array<{
+      name?: string;
+      section_type?: QuestionSpec['question_type'] | 'mixed';
+      instructions?: string;
+      questions?: Array<{
+        question_type: QuestionSpec['question_type'];
+        count: number;
+        marks: number;
+        difficulty?: Difficulty;
+      }>;
+    }>;
+  }>;
+};
 
 type QuestionType = typeof QUESTION_TYPES[number]['value'];
 type Difficulty = typeof DIFFICULTIES[number];
@@ -75,21 +101,26 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
   // Sections & Questions
   const [sections, setSections] = useState<PaperSection[]>([
     {
-      name: 'Section A - Short Questions',
+      name: 'Section A - Short Answer Questions',
       instructions: 'Answer briefly in 2-3 sentences',
-      questions: []
+      questions: [],
+      section_type: 'short'
     }
   ]);
 
   // UI State
-  const [suggestions, setSuggestions] = useState<TopicSuggestion[]>([]);
+  const [suggestions, setSuggestions] = useState<PDFSuggestion[]>([]);
   const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [collapsedPdfs, setCollapsedPdfs] = useState<Set<string>>(new Set());
   const [generating, setGenerating] = useState(false);
   const [generationProgress, setGenerationProgress] = useState('');
   const [progressPercent, setProgressPercent] = useState(0);
   const [currentQuestion, setCurrentQuestion] = useState<{num: number, topic: string, preview?: string} | null>(null);
   const [completedQuestions, setCompletedQuestions] = useState<number[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [autoExamType, setAutoExamType] = useState<ExamType>('CIE');
+  const [autoTopics, setAutoTopics] = useState<string>('');
+  const [autoError, setAutoError] = useState<string | null>(null);
 
   // Generated papers
   const [papers, setPapers] = useState<GeneratedPaper[]>([]);
@@ -128,6 +159,10 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
   // Accordion state for sections
   const [expandedSections, setExpandedSections] = useState<Set<number>>(new Set([0]));
 
+  // Section type modal
+  const [showSectionTypeModal, setShowSectionTypeModal] = useState(false);
+  const [pendingSectionType, setPendingSectionType] = useState<'short' | 'long' | 'mcq' | 'numerical' | 'mixed'>('short');
+
   // Fetch suggestions on mount
   useEffect(() => {
     fetchSuggestions();
@@ -137,12 +172,12 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
   const fetchSuggestions = async () => {
     setLoadingSuggestions(true);
     try {
-      console.log('[Suggestions] Fetching suggestions from API...');
-      const suggs = await getSuggestions();
+      console.log('[Suggestions] Fetching PDF-grouped suggestions from API...');
+      const suggs = await getSuggestionsByPDF();
       console.log('[Suggestions] Received:', suggs);
       if (Array.isArray(suggs) && suggs.length > 0) {
         setSuggestions(suggs);
-        console.log('[Suggestions] Set', suggs.length, 'suggestions');
+        console.log('[Suggestions] Set', suggs.length, 'PDF groups with suggestions');
       } else {
         console.warn('[Suggestions] Received empty or invalid suggestions:', suggs);
         setSuggestions([]);
@@ -160,6 +195,51 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
       setPapers(paperList);
     } catch (err) {
       console.error('Failed to fetch papers:', err);
+    }
+  };
+
+  const handleDeletePaper = async (paperId: string) => {
+    if (!window.confirm('Delete this paper? This action cannot be undone.')) {
+      return;
+    }
+
+    try {
+      const result = await deletePaper(paperId);
+      if (result.success) {
+        setPapers(papers.filter(p => p.paper_id !== paperId));
+        if (selectedPaper?.paper_id === paperId) {
+          setSelectedPaper(null);
+        }
+      } else {
+        alert(`Failed to delete: ${result.message}`);
+      }
+    } catch (error) {
+      console.error('Delete error:', error);
+      alert('Failed to delete paper');
+    }
+  };
+
+  const handleRenamePaper = async (paperId: string, currentTitle: string) => {
+    const newTitle = prompt('Enter new paper title:', currentTitle);
+    if (!newTitle || newTitle === currentTitle) {
+      return;
+    }
+
+    try {
+      const result = await updatePaperTitle(paperId, newTitle);
+      if (result.success) {
+        setPapers(papers.map(p => 
+          p.paper_id === paperId ? { ...p, title: newTitle } : p
+        ));
+        if (selectedPaper?.paper_id === paperId) {
+          setSelectedPaper({ ...selectedPaper, title: newTitle });
+        }
+      } else {
+        alert(`Failed to rename: ${result.message}`);
+      }
+    } catch (error) {
+      console.error('Rename error:', error);
+      alert('Failed to rename paper');
     }
   };
 
@@ -226,15 +306,32 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
 
   // Section management
   const addSection = () => {
+    setShowSectionTypeModal(true);
+  };
+
+  const createSectionWithType = (sectionType: 'short' | 'long' | 'mcq' | 'numerical' | 'mixed') => {
+    const typeNames = {
+      short: 'Short Answer Questions',
+      long: 'Long Answer Questions',
+      mcq: 'Multiple Choice Questions',
+      numerical: 'Numerical Problems',
+      mixed: 'Mixed Questions'
+    };
+
     setSections([
       ...sections,
       {
-        name: `Section ${String.fromCharCode(65 + sections.length)}`,
-        instructions: '',
-        questions: []
+        name: `Section ${String.fromCharCode(65 + sections.length)} - ${typeNames[sectionType]}`,
+        instructions: sectionType === 'short' ? 'Answer briefly in 2-3 sentences' :
+                      sectionType === 'long' ? 'Answer in detail with examples' :
+                      sectionType === 'mcq' ? 'Choose the correct option' :
+                      sectionType === 'numerical' ? 'Show your calculations' : '',
+        questions: [],
+        section_type: sectionType
       }
     ]);
     setExpandedSections(new Set([...expandedSections, sections.length]));
+    setShowSectionTypeModal(false);
   };
 
   const removeSection = (idx: number) => {
@@ -248,15 +345,236 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
 
   // Question management
   const addQuestion = (sectionIdx: number, topic: string = '') => {
+    const section = sections[sectionIdx];
+    const sectionType = section.section_type || 'short';
+    
+    // Default marks by type
+    const defaultMarks = {
+      short: 2,
+      long: 5,
+      mcq: 1,
+      numerical: 3,
+      mixed: 2
+    };
+
     const newQ: QuestionSpec = {
       topic: topic,
-      question_type: 'short',
+      question_type: sectionType === 'mixed' ? 'short' : sectionType as any,
       difficulty: 'Medium',
-      marks: 2
+      marks: defaultMarks[sectionType]
     };
     const updated = [...sections];
     updated[sectionIdx].questions.push(newQ);
     setSections(updated);
+  };
+
+  const normalizeQuestionType = (
+    raw: string | undefined,
+    sectionType: QuestionSpec['question_type'] | 'mixed'
+  ): QuestionSpec['question_type'] => {
+    const t = (raw || '').toLowerCase();
+    if (sectionType === 'mcq') return 'mcq';
+    if (sectionType === 'numerical') return 'numerical';
+    if (t.includes('mcq')) return 'mcq';
+    if (t.includes('numerical') || t.includes('problem')) return 'numerical';
+    if (t.includes('long') || t.includes('descriptive')) return 'long';
+    return sectionType === 'long' ? 'long' : 'short';
+  };
+
+  // Build a marks array that sums to target using allowed marks and a max length
+  const buildMarksDistribution = (
+    allowed: number[],
+    target: number,
+    desiredCount?: number
+  ): number[] => {
+    const uniq = Array.from(new Set(allowed)).filter((x) => x > 0).sort((a, b) => a - b);
+    const min = uniq[0] || 1;
+    const maxCountFromMin = Math.max(1, Math.floor(target / min));
+
+    const countsToTry: number[] = [];
+    if (desiredCount && desiredCount > 0) {
+      countsToTry.push(desiredCount);
+    }
+    // Try around desired count if needed
+    for (let c = Math.max(1, (desiredCount || maxCountFromMin) - 5); c <= (desiredCount || maxCountFromMin) + 5; c++) {
+      if (!countsToTry.includes(c)) countsToTry.push(c);
+    }
+
+    const memo = new Map<string, number[] | null>();
+    const choose = (count: number, sum: number): number[] | null => {
+      const key = `${count}|${sum}`;
+      if (memo.has(key)) return memo.get(key) || null;
+      if (count === 0) return sum === 0 ? [] : null;
+      for (const m of uniq) {
+        if (m > sum) continue;
+        const rec = choose(count - 1, sum - m);
+        if (rec) {
+          memo.set(key, [m, ...rec]);
+          return memo.get(key)!;
+        }
+      }
+      memo.set(key, null);
+      return null;
+    };
+
+    for (const cnt of countsToTry) {
+      if (cnt <= 0) continue;
+      const res = choose(cnt, target);
+      if (res && res.length === cnt) return res;
+    }
+
+    // Fallback: fill greedily with largest marks until close to target, then adjust
+    const greedy = [] as number[];
+    let remaining = target;
+    while (remaining > 0) {
+      const m = uniq.filter((x) => x <= remaining).pop() || min;
+      greedy.push(m);
+      remaining -= m;
+    }
+    return greedy;
+  };
+
+  // Helper: detect question type from section name
+  const getQTypeForSection = (sectionName: string, fallback: string): QuestionSpec['question_type'] => {
+    const lower = (sectionName || '').toLowerCase();
+    if (lower.includes('short') || lower.includes('definition') || lower.includes('fill')) return 'short';
+    if (lower.includes('mcq')) return 'mcq';
+    if (lower.includes('numerical') || lower.includes('problem')) return 'numerical';
+    if (lower.includes('descriptive') || lower.includes('analytical') || lower.includes('long')) return 'long';
+    return fallback as QuestionSpec['question_type'];
+  };
+
+  const buildSectionsFromTemplate = (examType: ExamType, topicsInput: string) => {
+    setAutoError(null);
+    const cfg = (paperFormats as FormatConfig).exam_formats?.[examType];
+    if (!cfg || !cfg.sections || cfg.sections.length === 0) {
+      setAutoError(`No template found for ${examType}. Update frontend/config/paperFormats.json.`);
+      return;
+    }
+
+    const topicList = topicsInput
+      .split(/[,\n]/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    // Topics cycle through provided list; questions differ based on type/marks
+    const pickTopic = (idx: number): string => {
+      if (topicList.length === 0) return 'General topic';
+      return topicList[idx % topicList.length];
+    };
+
+    const newSections: PaperSection[] = [];
+
+    cfg.sections.forEach((section, sIdx) => {
+      const sectionQuestions: QuestionSpec[] = [];
+
+      const pattern: any = (section as any).question_pattern;
+      if (pattern) {
+        const desiredCount = pattern.number_of_questions || pattern.questions_to_answer || pattern.total_questions_listed || 0;
+        const allowedMarks: number[] = Array.isArray(pattern.marks_per_question) && pattern.marks_per_question.length > 0
+          ? pattern.marks_per_question
+          : [1];
+        const totalMarks: number = pattern.total_marks || 0;
+
+        // Special handling: SEE structured sections
+        if (pattern.structure && Array.isArray(pattern.structure)) {
+          const chosenCount = pattern.questions_to_answer || desiredCount || 5;
+          // Derive per-question totals: compulsory + each choice pair’s total
+          const perQuestionTotals: number[] = [];
+          for (const item of pattern.structure) {
+            if (item.compulsory && Array.isArray(item.sub_questions)) {
+              const sum = item.sub_questions.reduce((s: number, sq: any) => s + (sq.marks || 0), 0);
+              perQuestionTotals.push(sum);
+            }
+            if (Array.isArray(item.choice_pairs)) {
+              for (const pair of item.choice_pairs) {
+                const sum = (pair.pattern || []).reduce((s: number, p: any) => s + (p.marks || 0), 0);
+                perQuestionTotals.push(sum);
+              }
+            }
+          }
+          // Choose the first N totals to match questions_to_answer; if total_marks present, ensure sum aligns
+          const selected = perQuestionTotals.slice(0, chosenCount);
+          const sumSelected = selected.reduce((a, b) => a + b, 0);
+          const scale = totalMarks && sumSelected !== totalMarks ? totalMarks / sumSelected : 1;
+          const normalized = selected.map((m) => Math.round(m * scale));
+          const sectionName = section.name || `Section ${String.fromCharCode(65 + sIdx)}`;
+          const qType = getQTypeForSection(sectionName, section.section_type as any);
+          console.log(`SEE Section "${sectionName}": generated ${normalized.length} questions with marks [${normalized.join(', ')}], sum=${normalized.reduce((a,b)=>a+b,0)}, target=${totalMarks}`);
+          normalized.forEach((m, i) => {
+            sectionQuestions.push({
+              topic: pickTopic(i + sIdx),
+              question_type: qType,
+              difficulty: 'Medium',
+              marks: m,
+            });
+          });
+        } else {
+          // Generic pattern using marks_per_question and total_marks
+          const distribution = totalMarks > 0
+            ? buildMarksDistribution(allowedMarks, totalMarks, desiredCount)
+            : new Array(Math.max(1, desiredCount || 1)).fill(allowedMarks[0]);
+
+          const sectionName2 = section.name || `Section ${String.fromCharCode(65 + sIdx)}`;
+          const qType2 = getQTypeForSection(sectionName2, section.section_type as any);
+          console.log(`Section "${sectionName2}" (type: ${qType2}): generated ${distribution.length} questions with marks [${distribution.join(', ')}], sum=${distribution.reduce((a,b)=>a+b,0)}, target=${totalMarks}`);
+          distribution.forEach((m, i) => {
+            sectionQuestions.push({
+              topic: pickTopic(i + sIdx),
+              question_type: qType2,
+              difficulty: 'Medium',
+              marks: m,
+            });
+          });
+        }
+      }
+
+      // Fallback to any legacy questions array
+      if (sectionQuestions.length === 0 && (section as any).questions) {
+        (section as any).questions.forEach((qBlock: any) => {
+          const count = Math.max(1, qBlock.count || 1);
+          for (let i = 0; i < count; i++) {
+            sectionQuestions.push({
+              topic: pickTopic(sectionQuestions.length + sIdx),
+              question_type: qBlock.question_type,
+              difficulty: qBlock.difficulty || 'Medium',
+              marks: qBlock.marks || 1,
+            });
+          }
+        });
+      }
+
+      newSections.push({
+        name: section.name || `Section ${String.fromCharCode(65 + newSections.length)}`,
+        instructions: section.instructions || '',
+        section_type: section.section_type as any,
+        questions: sectionQuestions,
+      });
+    });
+
+    setSections(newSections);
+    if (cfg.instructions && cfg.instructions.length > 0) {
+      setInstructions(cfg.instructions);
+    }
+    if (cfg.duration_minutes) {
+      setDuration(cfg.duration_minutes);
+    }
+    if (cfg.title) {
+      setTitle(cfg.title);
+    }
+    if (topicList.length > 0) {
+      setSubject((prev) => prev || `${examType} Paper`);
+    }
+  };
+
+  const handleAutoBuild = async (shouldGenerate: boolean) => {
+    buildSectionsFromTemplate(autoExamType, autoTopics);
+    if (shouldGenerate) {
+      // Defer generate to next tick to ensure state is applied
+      setTimeout(() => {
+        handleGenerate();
+      }, 0);
+    }
   };
 
   const removeQuestion = (sectionIdx: number, qIdx: number) => {
@@ -643,31 +961,82 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
             </div>
 
             {suggestions.length > 0 ? (
-              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
-                {suggestions.map((suggestion, idx) => (
-                  <button
-                    key={idx}
-                    onClick={() => {
-                      if (sections.length > 0) {
-                        addQuestion(0, suggestion.topic);
-                      }
-                    }}
-                    className="group p-3 bg-white rounded-xl border border-accent/20 text-left hover:border-accent hover:shadow-md transition-all duration-200"
-                    title={suggestion.examples?.length > 0 ? `Examples: ${suggestion.examples.join(', ')}` : ''}
-                  >
-                    <div className="flex items-start gap-2">
-                      <Icons.Plus className="w-4 h-4 text-accent opacity-50 group-hover:opacity-100 mt-0.5 flex-shrink-0" />
-                      <div className="min-w-0">
-                        <div className="font-medium text-sm text-ink truncate">{suggestion.topic}</div>
-                        {suggestion.examples?.length > 0 && (
-                          <div className="text-xs text-ink-faint mt-0.5 truncate">
-                            {suggestion.examples[0]}
+              <div className="space-y-4">
+                {suggestions.map((pdfGroup, pdfIdx) => {
+                  const isCollapsed = collapsedPdfs.has(pdfGroup.filename);
+                  const totalTopics = suggestions.reduce((sum, pdf) => sum + pdf.count, 0);
+                  
+                  return (
+                    <div key={pdfIdx} className="border border-accent/20 rounded-xl overflow-hidden bg-white">
+                      {/* PDF Header */}
+                      <button
+                        onClick={() => {
+                          const newCollapsed = new Set(collapsedPdfs);
+                          if (isCollapsed) {
+                            newCollapsed.delete(pdfGroup.filename);
+                          } else {
+                            newCollapsed.add(pdfGroup.filename);
+                          }
+                          setCollapsedPdfs(newCollapsed);
+                        }}
+                        className="w-full flex items-center justify-between p-4 hover:bg-accent/5 transition-colors"
+                      >
+                        <div className="flex items-center gap-3">
+                          <Icons.File className="w-5 h-5 text-accent" />
+                          <div className="text-left">
+                            <div className="font-medium text-ink">{pdfGroup.filename}</div>
+                            <div className="flex items-center gap-2 text-xs text-ink-faint mt-0.5">
+                              {pdfGroup.unit_name && (
+                                <span className="px-2 py-0.5 bg-accent/10 rounded text-accent font-medium">
+                                  Unit {pdfGroup.unit_number}: {pdfGroup.unit_name}
+                                </span>
+                              )}
+                              <span>{pdfGroup.count} topic{pdfGroup.count !== 1 ? 's' : ''}</span>
+                              {pdfGroup.co_mapping && pdfGroup.co_mapping.length > 0 && (
+                                <span className="text-ink-faint">• {pdfGroup.co_mapping.join(', ')}</span>
+                              )}
+                            </div>
                           </div>
+                        </div>
+                        {isCollapsed ? (
+                          <Icons.ChevronRight className="w-5 h-5 text-ink-light" />
+                        ) : (
+                          <Icons.ChevronDown className="w-5 h-5 text-ink-light" />
                         )}
-                      </div>
+                      </button>
+
+                      {/* Topics Grid */}
+                      {!isCollapsed && (
+                        <div className="px-4 pb-4 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                          {pdfGroup.suggestions.map((suggestion, idx) => (
+                            <button
+                              key={idx}
+                              onClick={() => {
+                                if (sections.length > 0) {
+                                  addQuestion(0, suggestion.topic);
+                                }
+                              }}
+                              className="group p-3 bg-gray-50 rounded-lg border border-accent/10 text-left hover:border-accent hover:bg-white hover:shadow-md transition-all duration-200"
+                              title={suggestion.examples?.length > 0 ? `Examples: ${suggestion.examples.join(', ')}` : ''}
+                            >
+                              <div className="flex items-start gap-2">
+                                <Icons.Plus className="w-4 h-4 text-accent opacity-50 group-hover:opacity-100 mt-0.5 flex-shrink-0" />
+                                <div className="min-w-0">
+                                  <div className="font-medium text-sm text-ink truncate">{suggestion.topic}</div>
+                                  {suggestion.examples?.length > 0 && (
+                                    <div className="text-xs text-ink-faint mt-0.5 truncate">
+                                      {suggestion.examples[0]}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                  </button>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="text-center py-6 text-ink-light">
@@ -681,7 +1050,66 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
                 </button>
               </div>
             )}
-            <p className="text-xs text-ink-faint">Click a topic to add it as a question • Found {suggestions.length} topics in your documents</p>
+            <p className="text-xs text-ink-faint">
+              Click a topic to add it as a question • Found {suggestions.reduce((sum, pdf) => sum + pdf.count, 0)} topics across {suggestions.length} document{suggestions.length !== 1 ? 's' : ''}
+            </p>
+          </div>
+
+          {/* Auto Paper Builder */}
+          <div className="bg-white rounded-2xl border border-warm-200 shadow-lg p-6 space-y-4">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <Icons.ClipboardList className="w-5 h-5 text-accent" />
+                <h2 className="font-display text-lg font-semibold text-ink">Auto Paper Builder</h2>
+              </div>
+              <div className="flex items-center gap-3">
+                <label className="text-sm font-medium text-ink-light">Exam Type</label>
+                <select
+                  value={autoExamType}
+                  onChange={(e) => setAutoExamType(e.target.value as ExamType)}
+                  className="px-3 py-2 rounded-lg border border-warm-200 text-sm focus:border-accent focus:ring-1 focus:ring-accent/20"
+                >
+                  <option value="CIE">CIE</option>
+                  <option value="SEE">SEE</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-ink-light mb-2">Important topics to cover</label>
+              <textarea
+                value={autoTopics}
+                onChange={(e) => setAutoTopics(e.target.value)}
+                rows={3}
+                placeholder="Comma or newline separated topics (e.g., Search strategies, Agents, Informed search)"
+                className="w-full rounded-xl border border-warm-200 px-3 py-2 text-sm focus:border-accent focus:ring-1 focus:ring-accent/20"
+              />
+              <p className="text-xs text-ink-faint mt-1">Templates live at frontend/config/paperFormats.json. Update that file to change sections, counts, and marks.</p>
+            </div>
+
+            {autoError && (
+              <div className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+                {autoError}
+              </div>
+            )}
+
+            <div className="flex items-center gap-3 flex-wrap">
+              <button
+                onClick={() => handleAutoBuild(false)}
+                className="px-4 py-2 bg-accent text-white rounded-xl font-semibold hover:bg-accent-hover transition flex items-center gap-2"
+              >
+                <Icons.Layers className="w-4 h-4" />
+                Auto-build paper
+              </button>
+              <button
+                onClick={() => handleAutoBuild(true)}
+                className="px-4 py-2 bg-ink text-white rounded-xl font-semibold hover:bg-ink/90 transition flex items-center gap-2"
+                disabled={generating}
+              >
+                <Icons.Zap className="w-4 h-4" />
+                Auto-build & generate
+              </button>
+            </div>
           </div>
 
           {/* Sections */}
@@ -726,6 +1154,17 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
                       onClick={(e) => e.stopPropagation()}
                       className="font-display font-semibold text-ink bg-transparent border-none focus:ring-0 p-0"
                     />
+                    {section.section_type && (
+                      <span className={`text-xs px-2 py-1 rounded-full font-medium ${
+                        section.section_type === 'short' ? 'bg-blue-50 text-blue-700' :
+                        section.section_type === 'long' ? 'bg-purple-50 text-purple-700' :
+                        section.section_type === 'mcq' ? 'bg-green-50 text-green-700' :
+                        section.section_type === 'numerical' ? 'bg-orange-50 text-orange-700' :
+                        'bg-pink-50 text-pink-700'
+                      }`}>
+                        {section.section_type === 'mcq' ? 'MCQ' : section.section_type.charAt(0).toUpperCase() + section.section_type.slice(1)}
+                      </span>
+                    )}
                     <span className="text-xs text-ink-faint bg-warm-100 px-2 py-1 rounded-full">
                       {section.questions.length} questions
                     </span>
@@ -964,11 +1403,13 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
                 papers.map((paper) => (
                   <div
                     key={paper.paper_id}
-                    onClick={() => setSelectedPaper(paper)}
-                    className="bg-surface rounded-2xl border border-warm-100 p-6 hover:border-accent/30 hover:shadow-lg transition-all cursor-pointer group"
+                    className="bg-surface rounded-2xl border border-warm-100 p-6 hover:border-accent/30 hover:shadow-lg transition-all group"
                   >
-                    <div className="flex items-start justify-between">
-                      <div>
+                    <div className="flex items-start justify-between gap-4">
+                      <div 
+                        onClick={() => setSelectedPaper(paper)}
+                        className="flex-1 cursor-pointer"
+                      >
                         <h3 className="font-display text-xl font-semibold text-ink group-hover:text-accent transition-colors">
                           {paper.title}
                         </h3>
@@ -988,7 +1429,28 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
                           </span>
                         </div>
                       </div>
-                      <Icons.ChevronRight className="w-5 h-5 text-ink-faint group-hover:text-accent transition-colors" />
+                      <div className="flex flex-col gap-2">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRenamePaper(paper.paper_id, paper.title);
+                          }}
+                          className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition"
+                          title="Rename paper"
+                        >
+                          <Icons.Edit className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeletePaper(paper.paper_id);
+                          }}
+                          className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition"
+                          title="Delete paper"
+                        >
+                          <Icons.Trash className="w-4 h-4" />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))
@@ -1739,6 +2201,132 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
                 className="px-4 py-2 bg-warm-100 text-ink rounded-xl text-sm font-medium hover:bg-warm-200 transition-all"
               >
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Section Type Selection Modal */}
+      {showSectionTypeModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-warm-50 rounded-2xl shadow-2xl max-w-2xl w-full mx-4 max-h-[90vh] overflow-y-auto">
+            <div className="border-b border-warm-100 px-6 py-4">
+              <h2 className="font-display text-2xl font-bold text-ink flex items-center gap-2">
+                <Icons.Layers className="w-6 h-6 text-accent" />
+                Choose Section Type
+              </h2>
+              <p className="text-sm text-ink-light mt-1">Select the type of questions for this section</p>
+            </div>
+
+            <div className="p-6 space-y-3">
+              {/* Short Answer Section */}
+              <button
+                onClick={() => createSectionWithType('short')}
+                className="w-full p-4 bg-white rounded-xl border-2 border-accent/20 hover:border-accent hover:shadow-lg transition-all text-left group"
+              >
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:bg-blue-200 transition-colors">
+                    <Icons.FileText className="w-6 h-6 text-blue-600" />
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-ink text-lg">Short Answer Questions</h3>
+                    <p className="text-sm text-ink-light mt-1">Brief answers in 2-3 sentences • 2 marks each</p>
+                    <div className="flex gap-2 mt-2">
+                      <span className="text-xs px-2 py-1 bg-blue-50 text-blue-700 rounded-full font-medium">2 Marks</span>
+                      <span className="text-xs px-2 py-1 bg-warm-100 text-ink-faint rounded-full">Short Type</span>
+                    </div>
+                  </div>
+                </div>
+              </button>
+
+              {/* Long Answer Section */}
+              <button
+                onClick={() => createSectionWithType('long')}
+                className="w-full p-4 bg-white rounded-xl border-2 border-accent/20 hover:border-accent hover:shadow-lg transition-all text-left group"
+              >
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:bg-purple-200 transition-colors">
+                    <Icons.Book className="w-6 h-6 text-purple-600" />
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-ink text-lg">Long Answer Questions</h3>
+                    <p className="text-sm text-ink-light mt-1">Detailed answers with examples and explanations • 5 marks each</p>
+                    <div className="flex gap-2 mt-2">
+                      <span className="text-xs px-2 py-1 bg-purple-50 text-purple-700 rounded-full font-medium">5 Marks</span>
+                      <span className="text-xs px-2 py-1 bg-warm-100 text-ink-faint rounded-full">Long Type</span>
+                    </div>
+                  </div>
+                </div>
+              </button>
+
+              {/* MCQ Section */}
+              <button
+                onClick={() => createSectionWithType('mcq')}
+                className="w-full p-4 bg-white rounded-xl border-2 border-accent/20 hover:border-accent hover:shadow-lg transition-all text-left group"
+              >
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:bg-green-200 transition-colors">
+                    <Icons.Check className="w-6 h-6 text-green-600" />
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-ink text-lg">Multiple Choice Questions</h3>
+                    <p className="text-sm text-ink-light mt-1">Choose the correct option from 4 choices • 1 mark each</p>
+                    <div className="flex gap-2 mt-2">
+                      <span className="text-xs px-2 py-1 bg-green-50 text-green-700 rounded-full font-medium">1 Mark</span>
+                      <span className="text-xs px-2 py-1 bg-warm-100 text-ink-faint rounded-full">MCQ Type</span>
+                    </div>
+                  </div>
+                </div>
+              </button>
+
+              {/* Numerical Section */}
+              <button
+                onClick={() => createSectionWithType('numerical')}
+                className="w-full p-4 bg-white rounded-xl border-2 border-accent/20 hover:border-accent hover:shadow-lg transition-all text-left group"
+              >
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 bg-orange-100 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:bg-orange-200 transition-colors">
+                    <Icons.Code className="w-6 h-6 text-orange-600" />
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-ink text-lg">Numerical Problems</h3>
+                    <p className="text-sm text-ink-light mt-1">Calculations and problem-solving with steps • 3 marks each</p>
+                    <div className="flex gap-2 mt-2">
+                      <span className="text-xs px-2 py-1 bg-orange-50 text-orange-700 rounded-full font-medium">3 Marks</span>
+                      <span className="text-xs px-2 py-1 bg-warm-100 text-ink-faint rounded-full">Numerical Type</span>
+                    </div>
+                  </div>
+                </div>
+              </button>
+
+              {/* Mixed Section */}
+              <button
+                onClick={() => createSectionWithType('mixed')}
+                className="w-full p-4 bg-white rounded-xl border-2 border-accent/20 hover:border-accent hover:shadow-lg transition-all text-left group"
+              >
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 bg-pink-100 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:bg-pink-200 transition-colors">
+                    <Icons.Sparkles className="w-6 h-6 text-pink-600" />
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-ink text-lg">Mixed Questions</h3>
+                    <p className="text-sm text-ink-light mt-1">Flexible section with different question types • Variable marks</p>
+                    <div className="flex gap-2 mt-2">
+                      <span className="text-xs px-2 py-1 bg-pink-50 text-pink-700 rounded-full font-medium">Variable</span>
+                      <span className="text-xs px-2 py-1 bg-warm-100 text-ink-faint rounded-full">Mixed Type</span>
+                    </div>
+                  </div>
+                </div>
+              </button>
+            </div>
+
+            <div className="border-t border-warm-100 px-6 py-4 flex justify-end">
+              <button
+                onClick={() => setShowSectionTypeModal(false)}
+                className="px-4 py-2 bg-warm-100 text-ink rounded-xl text-sm font-medium hover:bg-warm-200 transition-all"
+              >
+                Cancel
               </button>
             </div>
           </div>

@@ -7,7 +7,8 @@ import {
   PaperGenerateResponse,
   GeneratedPaper,
   TopicSuggestion,
-  ProvenanceData
+  ProvenanceData,
+  PDFSuggestion
 } from '../types';
 
 // Configuration: Point this to your Python/Node/Go backend
@@ -58,7 +59,7 @@ const MOCK_UPLOAD: UploadResponse = {
  * 
  * Expected Response (JSON): GenerationResponse (see types.ts)
  */
-export const generateQuestion = async (topic: string, difficulty: string): Promise<GenerationResponse> => {
+export const generateQuestion = async (topic: string, difficulty: string, syllabusContext?: string): Promise<GenerationResponse> => {
   try {
     console.log(`[API] Fetching ${API_BASE}/generate...`);
     const response = await fetch(`${API_BASE}/generate`, {
@@ -66,7 +67,11 @@ export const generateQuestion = async (topic: string, difficulty: string): Promi
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ topic, difficulty }),
+      body: JSON.stringify({ 
+        topic, 
+        difficulty,
+        ...(syllabusContext && { syllabus_context: syllabusContext })
+      }),
     });
 
     if (!response.ok) {
@@ -145,6 +150,29 @@ export const getSuggestions = async (): Promise<TopicSuggestion[]> => {
     ];
   }
 };
+
+/**
+ * ENDPOINT: GET /suggestions-by-pdf
+ * Description: Get topic suggestions grouped by PDF file
+ * Returns array of {filename, suggestions, count}
+ */
+export const getSuggestionsByPDF = async (): Promise<PDFSuggestion[]> => {
+  try {
+    console.log(`[API] Fetching ${API_BASE}/suggestions-by-pdf...`);
+    const response = await fetch(`${API_BASE}/suggestions-by-pdf`);
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch PDF suggestions');
+    }
+
+    const data = await response.json();
+    return data.pdf_suggestions || [];
+  } catch (error) {
+    console.warn(`[API] Backend unreachable at ${API_BASE}/suggestions-by-pdf.`);
+    return [];
+  }
+};
+
 /**
  * ENDPOINT: POST /context
  * Description: Get PDF context for a topic (similar to CLI --show-context)
@@ -192,7 +220,27 @@ export const getDocuments = async (): Promise<UploadedDocument[]> => {
     return [];
   }
 };
+/**
+ * ENDPOINT: DELETE /documents/{filename}
+ * Description: Deletes an uploaded PDF document.
+ */
+export const deleteDocument = async (filename: string): Promise<{success: boolean, message: string}> => {
+  try {
+    console.log(`[API] Deleting document: ${filename}`);
+    const response = await fetch(`${API_BASE}/documents/${encodeURIComponent(filename)}`, {
+      method: 'DELETE',
+    });
 
+    if (!response.ok) {
+      throw new Error('Failed to delete document');
+    }
+
+    return response.json();
+  } catch (error) {
+    console.warn(`[API] Backend unreachable for delete operation.`);
+    return { success: false, message: 'Backend unreachable' };
+  }
+};
 // ============ PAPER GENERATOR API ============
 
 /**
@@ -282,6 +330,54 @@ export const listPapers = async (): Promise<GeneratedPaper[]> => {
   } catch (error) {
     console.warn(`[API] Backend unreachable at ${API_BASE}/paper/papers.`);
     return [];
+  }
+};
+
+/**
+ * ENDPOINT: DELETE /paper/{paper_id}
+ * Description: Delete a generated paper
+ */
+export const deletePaper = async (paperId: string): Promise<{success: boolean, message: string}> => {
+  try {
+    console.log(`[API] Deleting paper ${paperId}...`);
+    const response = await fetch(`${API_BASE}/paper/${paperId}`, {
+      method: 'DELETE',
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to delete paper');
+    }
+
+    return response.json();
+  } catch (error) {
+    console.warn(`[API] Backend unreachable for delete operation.`);
+    return { success: false, message: 'Backend unreachable' };
+  }
+};
+
+/**
+ * ENDPOINT: PATCH /paper/{paper_id}
+ * Description: Update paper title
+ */
+export const updatePaperTitle = async (paperId: string, title: string): Promise<{success: boolean, message: string}> => {
+  try {
+    console.log(`[API] Updating paper ${paperId} title...`);
+    const response = await fetch(`${API_BASE}/paper/${paperId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ title }),
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to update paper');
+    }
+
+    return response.json();
+  } catch (error) {
+    console.warn(`[API] Backend unreachable for update operation.`);
+    return { success: false, message: 'Backend unreachable' };
   }
 };
 
@@ -665,5 +761,117 @@ export const explainQuestion = async (questionId: number): Promise<ProvenanceDat
   } catch (error: any) {
     console.error(`[API] Failed to fetch provenance:`, error);
     throw error;
+  }
+};
+
+// =============================================================================
+// KNOWLEDGE HUB - Syllabus & PYQ Papers
+// =============================================================================
+
+export interface SyllabusInfo {
+  course_info: {
+    name: string;
+    code: string;
+    semester: string;
+    category: string;
+  };
+  units: Array<{
+    unit_number: number;
+    unit_name: string;
+    hours: number;
+    topics: Array<{
+      name: string;
+      subtopics: string[];
+    }>;
+    co_mapping: string[];
+    bloom_levels: string[];
+  }>;
+  course_outcomes: Record<string, string>;
+  co_po_mapping: Record<string, Record<string, number>>;
+  total_units: number;
+  credits: {
+    lecture: number;
+    tutorial: number;
+    practical: number;
+  };
+}
+
+export interface PYQPaper {
+  filename: string;
+  exam_name: string;
+  academic_year: string;
+  semester: string;
+  total_questions: number;
+  total_marks: number;
+  duration_minutes: number;
+  type_distribution: Record<string, number>;
+  difficulty_distribution: Record<string, number>;
+  co_distribution: Record<string, number>;
+}
+
+export interface PYQPapersResponse {
+  papers: PYQPaper[];
+  patterns_summary: {
+    total_papers_analyzed: number;
+    total_questions_analyzed: number;
+    co_patterns: Record<string, {
+      question_types: Record<string, number>;
+      marks_distribution: Record<string, number>;
+    }>;
+  };
+  total_papers: number;
+}
+
+/**
+ * ENDPOINT: GET /knowledge-hub/syllabus
+ * Description: Get complete syllabus information
+ */
+export const getSyllabusInfo = async (): Promise<SyllabusInfo | null> => {
+  try {
+    console.log(`[API] Fetching syllabus info...`);
+    const response = await fetch(`${API_BASE}/knowledge-hub/syllabus`);
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch syllabus');
+    }
+
+    const data = await response.json();
+    if (data.error) {
+      console.error('[API] Syllabus error:', data.error);
+      return null;
+    }
+    return data;
+  } catch (error) {
+    console.error(`[API] Failed to fetch syllabus:`, error);
+    return null;
+  }
+};
+
+/**
+ * ENDPOINT: GET /knowledge-hub/pyq-papers
+ * Description: Get previous year question papers with statistics
+ */
+export const getPYQPapers = async (): Promise<PYQPapersResponse> => {
+  try {
+    console.log(`[API] Fetching PYQ papers...`);
+    const response = await fetch(`${API_BASE}/knowledge-hub/pyq-papers`);
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch PYQ papers');
+    }
+
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error(`[API] Failed to fetch PYQ papers:`, error);
+    return {
+      papers: [],
+      patterns_summary: {
+        total_papers_analyzed: 0,
+        total_questions_analyzed: 0,
+        co_patterns: {}
+      },
+      total_papers: 0
+    };
   }
 };
