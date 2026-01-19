@@ -1113,3 +1113,134 @@ async def reload_configuration():
     except Exception as e:
         logger.error(f"Failed to reload config: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# STEP 4: PROVENANCE & EXPLAINABILITY LAYER
+# ============================================================================
+
+def get_chunks_by_ids(chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch chunk content from ChromaDB by chunk IDs.
+
+    Args:
+        chunk_ids: List of chunk IDs to retrieve
+
+    Returns:
+        Dictionary mapping chunk_id to chunk data (content, metadata)
+    """
+    if not chunk_ids:
+        return {}
+
+    try:
+        rag_engine = get_rag_engine()
+        chroma_db = rag_engine.vector_store.get_database()
+
+        # Get chunks by IDs
+        result = chroma_db._collection.get(ids=chunk_ids)
+
+        chunks_map = {}
+        if result and 'documents' in result and 'metadatas' in result:
+            for i, chunk_id in enumerate(result['ids']):
+                chunks_map[chunk_id] = {
+                    'content': result['documents'][i] if i < len(result['documents']) else '',
+                    'metadata': result['metadatas'][i] if i < len(result['metadatas']) else {}
+                }
+
+        return chunks_map
+    except Exception as e:
+        logger.error(f"Failed to fetch chunks by IDs: {e}")
+        return {}
+
+
+@app.get("/api/v1/question/{question_id}/explain")
+async def explain_question(question_id: int):
+    """
+    STEP 4: Provenance & Explainability Endpoint
+
+    Returns provenance data for a question including:
+    - Question text and metadata
+    - Bloom level, CO/PO tags
+    - Source documents with chunk content
+
+    This is READ-ONLY - no regeneration allowed.
+    """
+    try:
+        # Query SQLite for the question
+        import sqlite3
+        from app.core.question_bank import DB_PATH
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, topic, difficulty, question_text, answer_text,
+                          bloom_level, course_outcome, program_outcome,
+                          retrieved_chunk_ids, retrieved_doc_ids, source_type
+                   FROM templates WHERE id = ?""",
+                (question_id,)
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Question not found")
+
+        # Parse chunk and doc IDs from JSON
+        chunk_ids = json.loads(row['retrieved_chunk_ids']) if row['retrieved_chunk_ids'] else []
+        doc_ids = json.loads(row['retrieved_doc_ids']) if row['retrieved_doc_ids'] else []
+
+        # Fetch chunk content from ChromaDB
+        chunks_map = get_chunks_by_ids(chunk_ids)
+
+        # Group chunks by document
+        doc_chunks = {}
+        for chunk_id in chunk_ids:
+            if chunk_id in chunks_map:
+                chunk_data = chunks_map[chunk_id]
+                doc_source = chunk_data['metadata'].get('source', 'Unknown')
+
+                if doc_source not in doc_chunks:
+                    doc_chunks[doc_source] = []
+
+                # Limit content preview to 300 characters
+                content = chunk_data['content']
+                preview = content[:300] + '...' if len(content) > 300 else content
+
+                doc_chunks[doc_source].append({
+                    'chunk_id': chunk_id,
+                    'content_preview': preview,
+                    'page': chunk_data['metadata'].get('page', 'N/A')
+                })
+
+        # Build source documents list
+        source_documents = []
+        for doc_id in set(doc_ids):
+            chunks = doc_chunks.get(doc_id, [])
+            source_documents.append({
+                'doc_id': doc_id,
+                'chunk_count': len(chunks),
+                'chunks': chunks
+            })
+
+        # Build response
+        response = {
+            'question_id': row['id'],
+            'question_text': row['question_text'],
+            'answer': row['answer_text'],
+            'topic': row['topic'],
+            'difficulty': row['difficulty'],
+            'bloom_level': row['bloom_level'],
+            'course_outcome': row['course_outcome'],
+            'program_outcome': row['program_outcome'],
+            'source_type': row['source_type'],
+            'source_documents': source_documents,
+            'total_chunks_used': len(chunk_ids)
+        }
+
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to explain question {question_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

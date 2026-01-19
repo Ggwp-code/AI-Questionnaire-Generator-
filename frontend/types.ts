@@ -12,6 +12,10 @@ export interface QuestionData {
   computed_answer?: string;
   answer_warning?: string;
   quality_score?: number;  // Critic score 0-10
+  question_id?: number;  // Database ID for provenance lookup
+  bloom_level?: number;  // Bloom's taxonomy level
+  course_outcome?: string;  // CO tags
+  program_outcome?: string;  // PO tags
 }
 
 export interface UploadedDocument {
@@ -124,4 +128,31 @@ export interface PaperGenerateResponse {
   status: string;
   paper: GeneratedPaper;
   generation_time_seconds: number;
+}
+
+// Provenance & Explainability Types (Step 4)
+export interface SourceChunk {
+  chunk_id: string;
+  content_preview: string;
+  page: number | string;
+}
+
+export interface SourceDocument {
+  doc_id: string;
+  chunk_count: number;
+  chunks: SourceChunk[];
+}
+
+export interface ProvenanceData {
+  question_id: number;
+  question_text: string;
+  answer: string;
+  topic: string;
+  difficulty: string;
+  bloom_level: number | null;
+  course_outcome: string | null;
+  program_outcome: string | null;
+  source_type: string;
+  source_documents: SourceDocument[];
+  total_chunks_used: number;
 }
