@@ -25,8 +25,47 @@ from app.core.question_bank import get_existing_template, save_template, check_d
 from app.tools.utils import get_logger
 from app.services.metrics import get_metrics, timed_node, track_generation
 from app.config import get_format_instruction, get_tags, get_prompt_loader
+from app.config.pyq_analyzer import get_pyq_analyzer
+import json
+from pathlib import Path
 
 logger = get_logger("Tribunal_Engine")
+
+# Load question guidelines
+def load_guidelines():
+    """Load question generation guidelines"""
+    guidelines_path = Path(__file__).parent.parent / "config" / "question_guidelines.json"
+    try:
+        with open(guidelines_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load guidelines: {e}")
+        return {}
+
+QUESTION_GUIDELINES = load_guidelines()
+
+def calibrate_difficulty(difficulty: str, question_type: str) -> Dict[str, str]:
+    """Calibrate difficulty to be easier and provide strict constraints"""
+    # Make difficulties easier
+    calibrated = difficulty
+    if difficulty == "Hard":
+        calibrated = "Medium"
+    elif difficulty == "Medium":
+        calibrated = "Easy-Medium"
+    elif difficulty == "Easy":
+        calibrated = "Very Easy"
+    
+    # Get guidelines for this difficulty/type
+    guidelines = QUESTION_GUIDELINES.get('difficulty_guidelines', {}).get(difficulty, {})
+    type_constraints = QUESTION_GUIDELINES.get('question_type_constraints', {}).get(question_type, {})
+    
+    return {
+        'calibrated_difficulty': calibrated,
+        'max_answer_length': guidelines.get(question_type, {}).get('answer_length', 'Concise'),
+        'complexity': guidelines.get(question_type, {}).get('complexity', 'Simple'),
+        'type_constraints': type_constraints,
+        'original_difficulty': difficulty
+    }
 
 # --- TOPIC TYPE DETECTION (Context-Based) ---
 
@@ -586,11 +625,51 @@ def generate_theory_question(state: AgentState) -> Dict:
     """Generate question for CONCEPTUAL topics - no code needed, test understanding directly"""
     context = state.get('retrieved_context', '')
     question_type = state.get('question_type', 'short')
+    marks = state.get('marks', 2)
+    co_mapping = state.get('co_mapping', [])
 
-    logger.info(f"[Phase 2-THEORY] Generating conceptual/theory question (type={question_type})...")
+    logger.info(f"[Phase 2-THEORY] Generating conceptual/theory question (type={question_type}, marks={marks})...")
 
-    # Build format instructions based on question_type
-    if question_type == 'mcq':
+    # Get difficulty calibration and PYQ patterns
+    difficulty_info = calibrate_difficulty(state['target_difficulty'], question_type)
+    pyq_analyzer = get_pyq_analyzer()
+    pyq_hints = pyq_analyzer.get_generation_hints(
+        marks=marks,
+        question_type=question_type,
+        co=co_mapping[0] if co_mapping else 'CO1',
+        difficulty=state['target_difficulty']
+    )
+
+    # Build STRICT format instructions based on question_type
+    if question_type == 'short':
+        format_instruction = f"""
+FORMAT: Short Answer Question
+- Create a VERY FOCUSED question answerable in {pyq_hints['expected_length']}
+- DO NOT use MCQ format - this requires a written response
+- The answer MUST be {pyq_hints['expected_length']} MAXIMUM
+- DO NOT ask multi-part questions
+- DO NOT require lengthy explanations
+
+STRICT CONSTRAINTS FOR SHORT ANSWER ({marks} marks):
+- Question should be 1-2 lines maximum
+- Answer MUST fit in {pyq_hints['expected_length']}
+- Focus on ONE specific concept only
+- Use simple, direct language
+- Difficulty: {difficulty_info['calibrated_difficulty']} (easier than {difficulty_info['original_difficulty']})
+
+EXAMPLES OF GOOD SHORT QUESTIONS:
+- "Define artificial intelligence."
+- "What is a rational agent?"
+- "Differentiate between BFS and DFS search."
+- "State the principle of A* search algorithm."
+
+AVOID:
+- "Explain in detail..."
+- "Discuss various aspects..."
+- Multi-part questions like (a), (b), (c)
+- Questions requiring examples and elaboration
+"""
+    elif question_type == 'mcq':
         format_instruction = """
 FORMAT: Multiple Choice Question (MCQ)
 - Present a clear question stem
@@ -600,41 +679,48 @@ FORMAT: Multiple Choice Question (MCQ)
 - The answer should be just the letter (e.g., "A")
 """
     elif question_type == 'long':
-        format_instruction = """
+        format_instruction = f"""
 FORMAT: Long Answer / Essay Question
 - Create a multi-part question with (a), (b), (c) parts
-- Each part should require a detailed explanation (2-4 sentences minimum)
+- Each part should require {pyq_hints['expected_length']}
 - DO NOT use MCQ format - this is an essay/written response question
 - The answer should be a comprehensive written response for each part
-"""
-    elif question_type == 'short':
-        format_instruction = """
-FORMAT: Short Answer Question
-- Create a focused question answerable in 2-5 sentences
-- DO NOT use MCQ format - this requires a written response
-- The answer should be a concise but complete explanation
+- Total answer length: {pyq_hints['expected_length']}
 """
     else:
-        format_instruction = """
+        format_instruction = f"""
 FORMAT: Open-ended Question
 - Create a question appropriate for the topic
+- Expected answer length: {pyq_hints['expected_length']}
 - The answer should be clear and comprehensive
 """
+
+    # Add PYQ style notes
+    pyq_style = "\n".join([f"- {note}" for note in pyq_hints['style_notes']])
 
     system_prompt = f"""You are an expert professor creating an exam question about a CONCEPTUAL topic.
 
 Topic: {state['topic']}
-Difficulty: {state['target_difficulty']}
+Marks: {marks}
+Original Difficulty: {state['target_difficulty']} → Calibrated to: {difficulty_info['calibrated_difficulty']}
+
+IMPORTANT: Make this question EASIER than typical {state['target_difficulty']} difficulty.
 
 Reference material from PDF:
 {context[:8000]}
 
-IMPORTANT: This is a CONCEPTUAL/THEORETICAL topic. Create a question that tests:
-- Understanding of definitions and concepts
-- Ability to explain, compare, or analyze ideas
-- Application of theoretical knowledge
-
+QUESTION GENERATION GUIDELINES:
 {format_instruction}
+
+STYLE NOTES FROM PREVIOUS YEAR PAPERS:
+{pyq_style}
+
+CRITICAL CONSTRAINTS:
+1. Answer length MUST be: {pyq_hints['expected_length']}
+2. Question complexity: {difficulty_info['complexity']}
+3. For {marks} marks questions, keep it focused and brief
+4. DO NOT make the question harder than necessary
+5. Use simple, clear language
 
 FORMATTING REQUIREMENTS:
 - Use SHORT paragraphs (2-3 sentences max)
@@ -648,17 +734,19 @@ The answer should be based DIRECTLY on the PDF content provided."""
     llm = get_llm(json_mode=QuestionDraft, mode="auto")
 
     try:
-        type_instruction = f" as a {question_type.upper()} question" if question_type else ""
+        type_instruction = f" as a {question_type.upper()} question worth {marks} marks" if question_type else ""
         response = llm.invoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Create a {state['target_difficulty']} conceptual question about {state['topic']}{type_instruction}.")
+            HumanMessage(content=f"Create a {difficulty_info['calibrated_difficulty']} conceptual question about {state['topic']}{type_instruction}. Remember: Keep it simple and focused!")
         ])
         q_data = response.model_dump()
         q_data['computed_answer'] = q_data.get('answer', '')  # No code verification for theory
         q_data['question_type'] = question_type  # Preserve the requested type
+        q_data['marks'] = marks
+        q_data['difficulty_rating'] = difficulty_info['calibrated_difficulty']
 
         # Self-refinement step
-        q_data = refine_question(q_data, state['topic'], state['target_difficulty'], question_type)
+        q_data = refine_question(q_data, state['topic'], difficulty_info['calibrated_difficulty'], question_type)
 
         logger.info("[Phase 2-THEORY] Theory question generation complete")
         return {'question_data': q_data, 'verification_passed': True}

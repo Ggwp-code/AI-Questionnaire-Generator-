@@ -37,7 +37,7 @@ for logger_name in ["transformers", "sentence_transformers", "chromadb",
 import time
 import json
 import asyncio
-from typing import Dict, Any, AsyncGenerator
+from typing import Dict, Any, AsyncGenerator, List
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -445,6 +445,148 @@ async def get_suggestions():
         # Return empty array instead of error to keep UI working
         return {"suggestions": [], "error": str(e)}
 
+@app.get("/api/v1/suggestions-by-pdf")
+async def get_suggestions_by_pdf():
+    """Get topic suggestions grouped by PDF using syllabus-based matching"""
+    try:
+        from app.rag import DocumentRegistry, get_rag_engine
+        from app.config.syllabus_loader import get_syllabus_loader
+        from langchain_openai import ChatOpenAI
+        import json
+        
+        registry = DocumentRegistry()
+        ingested_docs = registry.get_ingested_documents()
+        existing_pdfs = list(UPLOAD_DIR.glob("*.pdf"))
+        syllabus = get_syllabus_loader()
+
+        logger.info(f"[Suggestions By PDF] Found {len(existing_pdfs)} PDFs")
+
+        if not existing_pdfs:
+            return {"pdf_suggestions": [], "message": "No PDFs uploaded yet"}
+
+        pdf_suggestions = []
+        rag_engine = get_rag_engine()
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+        for pdf_file in existing_pdfs:
+            filename = pdf_file.name
+            suggestions = []
+
+            try:
+                # Determine which unit this PDF belongs to
+                unit_number = syllabus.match_unit_for_pdf(filename)
+                
+                if not unit_number:
+                    logger.warning(f"[Suggestions By PDF] Could not match {filename} to any unit")
+                    pdf_suggestions.append({
+                        "filename": filename,
+                        "unit_name": "Unknown Unit",
+                        "suggestions": [],
+                        "count": 0
+                    })
+                    continue
+
+                unit = syllabus.get_unit_by_number(unit_number)
+                unit_name = unit.get('unit_name', f'Unit {unit_number}')
+                
+                # Get PDF content
+                result = rag_engine.query_by_pdf(filename, k=20)
+                
+                if not result or not result.context or len(result.context) < 200:
+                    logger.warning(f"[Suggestions By PDF] Insufficient content from {filename}")
+                    pdf_suggestions.append({
+                        "filename": filename,
+                        "unit_name": unit_name,
+                        "suggestions": [],
+                        "count": 0
+                    })
+                    continue
+
+                # Get syllabus topics for this unit
+                unit_topics = syllabus.get_unit_topics(unit_number)
+                co_mapping = syllabus.get_co_mapping(unit_number)
+                bloom_levels = syllabus.get_bloom_levels(unit_number)
+
+                logger.info(f"[Suggestions By PDF] Unit {unit_number}: {len(unit_topics)} syllabus topics")
+
+                # Build topic list from syllabus
+                topic_list = []
+                for topic in unit_topics:
+                    topic_list.append(f"- {topic['name']}")
+                    for subtopic in topic.get('subtopics', []):
+                        topic_list.append(f"  - {subtopic}")
+                
+                syllabus_topics_str = "\n".join(topic_list)
+
+                # Use LLM to match PDF content with syllabus topics
+                extraction_prompt = f"""You are analyzing course material for Unit {unit_number}: {unit_name}.
+
+SYLLABUS TOPICS FOR THIS UNIT:
+{syllabus_topics_str}
+
+PDF CONTENT (first 7000 chars):
+{result.context[:7000]}
+
+Task: From the SYLLABUS TOPICS above, identify which topics are ACTUALLY covered in the PDF content. Return the most important topics and subtopics that have substantial content in the PDF.
+
+Return ONLY a JSON array with 10-15 topic objects:
+[
+  {{"topic": "Exact Topic Name from Syllabus", "examples": ["specific concept from PDF", "another concept"]}},
+  ...
+]
+
+Rules:
+- Use EXACT topic/subtopic names from the syllabus
+- Only include topics with actual content in the PDF
+- Examples should be specific terms/concepts found in the PDF
+- Prioritize main topics over subtopics
+- Return valid JSON only, no markdown"""
+
+                response = llm.invoke(extraction_prompt)
+                content = response.content.strip()
+                
+                # Remove markdown code blocks
+                if content.startswith("```"):
+                    content = content.split("```")[1]
+                    if content.startswith("json"):
+                        content = content[4:]
+                    content = content.strip()
+                
+                # Parse JSON
+                try:
+                    topics_data = json.loads(content)
+                    if isinstance(topics_data, list):
+                        suggestions = topics_data[:15]
+                        logger.info(f"[Suggestions By PDF] Unit {unit_number}: {len(suggestions)} topics matched")
+                    else:
+                        suggestions = []
+                except json.JSONDecodeError as je:
+                    logger.error(f"[Suggestions By PDF] JSON parse error: {je}")
+                    suggestions = []
+
+            except Exception as e:
+                logger.error(f"[Suggestions By PDF] Failed for {filename}: {e}", exc_info=True)
+                unit_name = "Unknown Unit"
+
+            pdf_suggestions.append({
+                "filename": filename,
+                "unit_name": unit_name,
+                "unit_number": unit_number if unit_number else 0,
+                "suggestions": suggestions,
+                "count": len(suggestions),
+                "co_mapping": co_mapping if unit_number else [],
+                "bloom_levels": bloom_levels if unit_number else []
+            })
+
+        total_topics = sum(pdf['count'] for pdf in pdf_suggestions)
+        logger.info(f"[Suggestions By PDF] Total: {total_topics} topics across {len(pdf_suggestions)} PDFs")
+        
+        return {"pdf_suggestions": pdf_suggestions}
+
+    except Exception as e:
+        logger.error(f"[Suggestions By PDF] Error: {e}", exc_info=True)
+        return {"pdf_suggestions": [], "error": str(e)}
+
 @app.get("/api/v1/bloom-levels")
 async def get_bloom_levels():
     """Get available Bloom's taxonomy cognitive levels for question generation"""
@@ -461,6 +603,103 @@ async def get_bloom_levels():
     # Sort by level
     levels.sort(key=lambda x: x["level"])
     return {"levels": levels}
+
+@app.get("/api/v1/knowledge-hub/syllabus")
+async def get_syllabus_info():
+    """Get complete syllabus information for display in Knowledge Hub"""
+    try:
+        from app.config.syllabus_loader import get_syllabus_loader
+        
+        syllabus = get_syllabus_loader()
+        course_info = syllabus.get_course_info()
+        units = syllabus.get_all_units()
+        
+        return {
+            "course_info": course_info,
+            "units": units,
+            "course_outcomes": syllabus.syllabus_data.get('course_outcomes', {}),
+            "co_po_mapping": syllabus.syllabus_data.get('co_po_mapping', {}),
+            "total_units": len(units),
+            "credits": syllabus.syllabus_data.get('credits', {})
+        }
+    except Exception as e:
+        logger.error(f"Failed to get syllabus: {e}")
+        return {"error": str(e), "units": []}
+
+@app.get("/api/v1/knowledge-hub/pyq-papers")
+async def get_pyq_papers():
+    """Get list of previous year question papers with statistics"""
+    try:
+        from app.config.pyq_analyzer import get_pyq_analyzer
+        import json
+        from pathlib import Path
+        
+        analyzer = get_pyq_analyzer()
+        pyq_dir = Path(__file__).parent / "data" / "previous_year_papers"
+        
+        papers = []
+        if pyq_dir.exists():
+            for json_file in pyq_dir.glob("*.json"):
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        paper = json.load(f)
+                        
+                        # Calculate statistics
+                        total_questions = len(paper.get('questions', []))
+                        total_marks = sum(q.get('marks', 0) for q in paper.get('questions', []))
+                        
+                        # Count by question type
+                        type_distribution = {}
+                        difficulty_distribution = {}
+                        co_distribution = {}
+                        
+                        for q in paper.get('questions', []):
+                            q_type = q.get('question_type', 'unknown')
+                            type_distribution[q_type] = type_distribution.get(q_type, 0) + 1
+                            
+                            diff = q.get('difficulty', 'Unknown')
+                            difficulty_distribution[diff] = difficulty_distribution.get(diff, 0) + 1
+                            
+                            for co in q.get('co_mapping', []):
+                                co_distribution[co] = co_distribution.get(co, 0) + 1
+                        
+                        papers.append({
+                            "filename": json_file.name,
+                            "exam_name": paper.get('exam_name', 'Unknown Exam'),
+                            "academic_year": paper.get('academic_year', 'N/A'),
+                            "semester": paper.get('semester', 'N/A'),
+                            "total_questions": total_questions,
+                            "total_marks": total_marks,
+                            "duration_minutes": paper.get('duration_minutes', 0),
+                            "type_distribution": type_distribution,
+                            "difficulty_distribution": difficulty_distribution,
+                            "co_distribution": co_distribution
+                        })
+                except Exception as e:
+                    logger.error(f"Failed to load {json_file}: {e}")
+        
+        # Add analyzer patterns summary
+        patterns_summary = {
+            "total_papers_analyzed": analyzer.patterns['total_papers'],
+            "total_questions_analyzed": analyzer.patterns['total_questions'],
+            "co_patterns": {}
+        }
+        
+        # Summarize CO patterns
+        for co, data in analyzer.patterns['by_co'].items():
+            patterns_summary['co_patterns'][co] = {
+                "question_types": dict(data['question_types']),
+                "marks_distribution": dict(data['marks_distribution'])
+            }
+        
+        return {
+            "papers": papers,
+            "patterns_summary": patterns_summary,
+            "total_papers": len(papers)
+        }
+    except Exception as e:
+        logger.error(f"Failed to get PYQ papers: {e}")
+        return {"papers": [], "error": str(e)}
 
 
 @app.post("/api/v1/context")
@@ -493,8 +732,10 @@ async def get_documents():
         # Build lookup from registry (deduplicate by filename, keep latest)
         registry_lookup = {}
         for doc in ingested_docs:
-            filename = doc['path'].split('/')[-1]
+            # Handle both Windows and Unix paths
+            filename = os.path.basename(doc['path'])
             registry_lookup[filename] = doc
+            logger.debug(f"[Documents] Registry entry: {filename} -> {doc.get('chunks', 0)} chunks")
 
         # Only show files that actually exist in uploads folder
         documents = []
@@ -507,10 +748,12 @@ async def get_documents():
 
             # Get metadata from registry if available
             reg_info = registry_lookup.get(filename, {})
+            chunk_count = int(reg_info.get('chunks', 0))
+            logger.debug(f"[Documents] {filename} -> {chunk_count} chunks")
             documents.append({
                 'filename': filename,
                 'path': str(pdf_file),
-                'chunks': int(reg_info.get('chunks', 0)),
+                'chunks': chunk_count,
                 'hash': reg_info.get('hash', '')[:12]
             })
 

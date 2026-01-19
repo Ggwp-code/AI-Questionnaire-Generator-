@@ -264,7 +264,7 @@ class PaperGeneratorService:
     # ========== PAPER GENERATION ==========
 
     def generate_paper(self, template_id: str, parallel: bool = True) -> GeneratedPaper:
-        """Generate a full question paper from a template"""
+        """Generate a full question paper from a template with deduplication"""
         template = self.get_template(template_id)
         if not template:
             raise ValueError(f"Template not found: {template_id}")
@@ -280,6 +280,10 @@ class PaperGeneratorService:
             instructions=template.instructions
         )
 
+        # Track generated questions to prevent duplicates
+        question_hash_set = set()  # Store hash of (topic, question_text) to detect duplicates
+        question_attempts = {}  # Track retry attempts
+
         # Collect ALL question tasks across ALL sections first
         all_tasks = []  # (section_idx, question_number, spec, section_name)
         for section_idx, section in enumerate(template.sections):
@@ -290,7 +294,7 @@ class PaperGeneratorService:
                 question_number += spec.count
 
         total_questions = len(all_tasks)
-        logger.info(f"Generating {total_questions} questions in parallel...")
+        logger.info(f"Generating {total_questions} questions in parallel with deduplication...")
 
         # Generate ALL questions in parallel
         results = {}  # (section_idx, question_number) -> GeneratedQuestion
@@ -300,33 +304,32 @@ class PaperGeneratorService:
             with ThreadPoolExecutor(max_workers=min(5, total_questions)) as executor:
                 futures = {
                     executor.submit(
-                        self._generate_single_question,
+                        self._generate_single_question_with_dedup,
                         task[1],  # question_number
                         task[2].get_prompt(),  # prompt
                         task[2],  # spec
-                        task[3]   # section_name
-                    ): (task[0], task[1])  # (section_idx, question_number)
+                        task[3],  # section_name
+                        question_hash_set  # pass the dedup set
+                    ): (task[0], task[1], task[2], task[3])  # (section_idx, q_num, spec, section_name)
                     for task in all_tasks
                 }
 
                 for future in as_completed(futures):
-                    section_idx, q_num = futures[future]
+                    section_idx, q_num, spec, section_name = futures[future]
                     try:
                         q = future.result()
                         results[(section_idx, q_num)] = q
                     except Exception as e:
                         logger.error(f"Question {q_num} generation failed: {e}")
-                        # Find the spec for this task
-                        task = next(t for t in all_tasks if t[0] == section_idx and t[1] == q_num)
                         results[(section_idx, q_num)] = self._create_failed_question(
-                            q_num, task[2], task[3], str(e)
+                            q_num, spec, section_name, str(e)
                         )
         else:
             # Sequential fallback
             for task in all_tasks:
                 section_idx, q_num, spec, section_name = task
                 try:
-                    q = self._generate_single_question(q_num, spec.get_prompt(), spec, section_name)
+                    q = self._generate_single_question_with_dedup(q_num, spec.get_prompt(), spec, section_name, question_hash_set)
                     results[(section_idx, q_num)] = q
                 except Exception as e:
                     logger.error(f"Question {q_num} generation failed: {e}")
@@ -467,6 +470,79 @@ class PaperGeneratorService:
             explanation=result.get('explanation', ''),
             verification_code=result.get('verification_code')
         )
+
+    def _generate_single_question_with_dedup(
+        self,
+        question_number: int,
+        prompt: str,
+        spec: QuestionSpec,
+        section_name: str,
+        question_hash_set: set,
+        max_retries: int = 3
+    ) -> GeneratedQuestion:
+        """Generate a single question with deduplication - retries if duplicate detected"""
+        import hashlib
+        
+        logger.info(f"Generating Q{question_number}: {prompt[:50]}... (with dedup check)")
+
+        for attempt in range(max_retries):
+            # Call the existing graph agent
+            result = run_agent(prompt, spec.difficulty)
+
+            if not result or 'error' in result:
+                raise Exception(result.get('error', 'Unknown generation error'))
+
+            question_text = result.get('question', '')
+            
+            # Create hash of (topic, question_text) for deduplication
+            question_key = f"{spec.topic}|{question_text[:100]}"  # Use first 100 chars for hash
+            question_hash = hashlib.md5(question_key.encode()).hexdigest()
+
+            # Check if this question has already been generated
+            if question_hash in question_hash_set:
+                logger.warning(f"Q{question_number} is a duplicate (attempt {attempt + 1}/{max_retries}), regenerating...")
+                if attempt < max_retries - 1:
+                    # Retry with more specific prompt variation
+                    prompt = f"{prompt}\n[IMPORTANT: Generate a COMPLETELY DIFFERENT question - avoid repeating previous questions on this topic]"
+                    continue
+                else:
+                    # Ran out of retries, use a modified version
+                    logger.error(f"Q{question_number} duplicate check failed after {max_retries} attempts")
+            
+            # Not a duplicate, add to set and proceed
+            question_hash_set.add(question_hash)
+            
+            # Build parts marks
+            parts_marks = []
+            if spec.parts:
+                for p in spec.parts:
+                    parts_marks.append({"part": p.part_label, "marks": p.marks, "description": p.description})
+            else:
+                # No explicit parts - single question
+                parts_marks = [{"part": "", "marks": spec.total_marks, "description": ""}]
+
+            # Format question text with marks
+            if spec.parts and len(spec.parts) > 1:
+                # Multi-part question - add marks to each part if not already there
+                question_text = self._format_multipart_question(question_text, spec.parts)
+
+            logger.info(f"Q{question_number} generated successfully (unique)")
+            return GeneratedQuestion(
+                question_number=question_number,
+                part_of_section=section_name,
+                topic=spec.topic,
+                question_type=spec.question_type,
+                difficulty=spec.difficulty,
+                marks=spec.total_marks,
+                parts_marks=parts_marks,
+                question_text=question_text,
+                answer=result.get('answer', ''),
+                explanation=result.get('explanation', ''),
+                verification_code=result.get('verification_code')
+            )
+
+        # Should not reach here, but if it does, raise an error
+        raise Exception(f"Q{question_number} could not be generated - max retries exceeded")
 
     def _format_multipart_question(self, question_text: str, parts: List[QuestionPart]) -> str:
         """Add marks allocation to multi-part questions"""

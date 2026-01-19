@@ -13,9 +13,14 @@ export interface QuestionData {
   answer_warning?: string;
   quality_score?: number;  // Critic score 0-10
   question_id?: number;  // Database ID for provenance lookup
-  bloom_level?: number;  // Bloom's taxonomy level
+  bloom_level?: number | string;  // Bloom's taxonomy level
   course_outcome?: string;  // CO tags
   program_outcome?: string;  // PO tags
+  unit_number?: number;
+  unit_name?: string;
+  question_type?: string;
+  co?: string;
+  topic?: string;
 }
 
 export interface UploadedDocument {
@@ -61,7 +66,15 @@ export interface TopicSuggestion {
   topic: string;
   examples: string[];
 }
-
+export interface PDFSuggestion {
+  filename: string;
+  unit_name?: string;
+  unit_number?: number;
+  suggestions: TopicSuggestion[];
+  count: number;
+  co_mapping?: string[];
+  bloom_levels?: string[];
+}
 // Paper Generator Types
 export interface QuestionSpec {
   topic: string;
@@ -74,6 +87,7 @@ export interface PaperSection {
   name: string;
   instructions?: string;
   questions: QuestionSpec[];
+  section_type?: 'short' | 'long' | 'mcq' | 'numerical' | 'mixed';
 }
 
 export interface PaperTemplate {
@@ -155,4 +169,66 @@ export interface ProvenanceData {
   source_type: string;
   source_documents: SourceDocument[];
   total_chunks_used: number;
+}
+
+export interface SyllabusInfo {
+  course_info: {
+    code: string;
+    name: string;
+    semester: number | string;
+    credits?: number | string;
+    category?: string;
+  };
+  course_outcomes: { code: string; description: string }[];
+  co_po_mapping?: Record<string, Record<string, number>>;
+  units: {
+    unit_number: number;
+    unit_name: string;
+    co_mapping: string[];
+    topics: {
+      name: string;
+      subtopics?: string[];
+      bloom_levels?: string[];
+    }[];
+  }[];
+}
+
+export interface PYQPapersResponse {
+  patterns_summary?: {
+    total_questions?: number;
+    unique_topics?: number;
+    total_papers_analyzed?: number;
+    total_questions_analyzed?: number;
+    co_patterns?: Record<
+      string,
+      {
+        question_types?: Record<string, number>;
+        marks_distribution?: Record<string, number>;
+      }
+    >;
+  };
+  papers: PYQPaper[];
+}
+
+export interface PYQPaper {
+  exam_name?: string;
+  academic_year?: string;
+  pdf_url?: string;
+  file_url?: string;
+  url?: string;
+  link?: string;
+  stats?: {
+    total_questions: number;
+    total_marks: number;
+    unique_cos: number;
+    type_distribution?: Record<string, number>;
+    difficulty_distribution?: Record<string, number>;
+    co_distribution?: Record<string, number>;
+  };
+  total_questions?: number;
+  total_marks?: number;
+  unique_cos?: number;
+  type_distribution?: Record<string, number>;
+  difficulty_distribution?: Record<string, number>;
+  co_distribution?: Record<string, number>;
 }

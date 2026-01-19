@@ -266,7 +266,12 @@ class HybridRetriever:
     @property
     def ranker(self):
         if not self._ranker and self.config.use_reranking:
-            self._ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
+            # Fix for Windows: Set cache directory to a valid location
+            import tempfile
+            cache_dir = os.path.join(tempfile.gettempdir(), "flashrank_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            self._ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir=cache_dir)
+            logger.info(f"[Ranker] Initialized with cache dir: {cache_dir}")
         return self._ranker
 
     def _search_single(self, query: str, k: int = 10) -> List:

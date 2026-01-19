@@ -2,11 +2,12 @@ import * as React from 'react';
 import { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { generateQuestion, getDocuments, explainQuestion } from '../services/api';
+import { generateQuestion, getDocuments, explainQuestion, getSyllabusInfo } from '../services/api';
 import { GenerationResponse, UploadedDocument, ProvenanceData } from '../types';
 import { Icons } from './ui/SystemIcons';
 import CodeViewer from './ui/CodeViewer';
 import ProvenanceModal from './ProvenanceModal';
+import { saveQuestionToBank } from '../services/questionBank';
 
 // Markdown component styles
 const markdownComponents = {
@@ -49,13 +50,11 @@ const DIFFICULTIES = ['Easy', 'Medium', 'Hard'];
 
 interface GenerationModuleProps {
   onGenerationComplete?: (data: GenerationResponse) => void;
-  restoreData?: GenerationResponse | null;
   onNavigateToIngest?: () => void;
 }
 
 const GenerationModule: React.FC<GenerationModuleProps> = ({
   onGenerationComplete,
-  restoreData,
   onNavigateToIngest
 }) => {
   const [topic, setTopic] = useState('');
@@ -65,6 +64,7 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [documents, setDocuments] = useState<UploadedDocument[]>([]);
+  const [syllabusContext, setSyllabusContext] = useState<string>('');
 
   // Provenance Modal State (Step 4)
   const [showProvenance, setShowProvenance] = useState(false);
@@ -81,6 +81,40 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
     fetchDocs();
   }, []);
 
+  // Fetch syllabus context on mount
+  useEffect(() => {
+    const fetchSyllabusTopics = async () => {
+      try {
+        const syllabus = await getSyllabusInfo();
+        let fullSyllabusText = '';
+
+        // Build syllabus context text and flatten topics
+        if (syllabus?.units && Array.isArray(syllabus.units)) {
+          syllabus.units.forEach((unit: any) => {
+            fullSyllabusText += `Unit ${unit.unit_number}: ${unit.unit_name}\n`;
+            if (unit.topics && Array.isArray(unit.topics)) {
+              unit.topics.forEach((topic: any) => {
+                if (topic.name) {
+                  fullSyllabusText += `- ${topic.name}\n`;
+                }
+                if (topic.subtopics && Array.isArray(topic.subtopics)) {
+                  topic.subtopics.forEach((subtopic: string) => {
+                    fullSyllabusText += `  • ${subtopic}\n`;
+                  });
+                }
+              });
+            }
+            fullSyllabusText += '\n';
+          });
+        }
+        setSyllabusContext(fullSyllabusText);
+      } catch (error) {
+        console.error('Failed to load syllabus topics:', error);
+      }
+    };
+    fetchSyllabusTopics();
+  }, []);
+
   // Auto-resize textarea
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
@@ -89,13 +123,6 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
       textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
     }
   }, [topic]);
-
-  // Handle data restoration from history
-  useEffect(() => {
-    if (restoreData) {
-      setData(restoreData);
-    }
-  }, [restoreData]);
 
   const handleGenerate = async (selectedTopic?: string) => {
     const topicToUse = selectedTopic || topic;
@@ -112,11 +139,37 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
     setAbortController(controller);
 
     try {
-      const res = await generateQuestion(topicToUse, difficulty);
+      const res = await generateQuestion(topicToUse, difficulty, syllabusContext);
       if (!controller.signal.aborted) {
         setData(res);
         if (onGenerationComplete) {
           onGenerationComplete(res);
+        }
+        // Save to question bank
+        if (res.data) {
+          const unitNumber = (res.data.unit_number as number | undefined) ?? 1;
+          const unitName = res.data.unit_name || `Unit ${unitNumber}`;
+          const bloom = res.data.bloom_level !== undefined ? String(res.data.bloom_level) : 'Apply';
+          const coTag = res.data.course_outcome || res.data.co || 'CO1';
+          const marks = (res.data as any).marks ?? 10;
+
+          saveQuestionToBank({
+            question_text: res.data.question,
+            marks,
+            difficulty: res.data.difficulty_rating || difficulty,
+            bloom_level: bloom,
+            co: coTag,
+            unit_number: unitNumber,
+            unit_name: unitName,
+            topic: res.data.topic || topicToUse,
+            type: res.data.question_type || 'Conceptual',
+            answer: res.data.answer || res.data.computed_answer,
+            computed_answer: res.data.computed_answer,
+            explanation: res.data.explanation,
+            source_filename: res.data.source_filename,
+            source_pages: res.data.source_pages,
+            question_id: res.data.question_id,
+          });
         }
       }
     } catch (err: any) {
@@ -185,7 +238,7 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
   };
 
   return (
-    <div className="flex flex-col space-y-16 animate-slide-up pb-20">
+    <div className="flex flex-col space-y-8 animate-slide-up pb-20">
 
       {/* INPUT SECTION */}
       <div className="max-w-3xl mx-auto w-full space-y-8">
@@ -256,56 +309,6 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
           </div>
         </div>
 
-        {/* UPLOADED DOCUMENTS SECTION */}
-        {!data && !loading && (
-          <div className="pt-8 space-y-6 animate-fade-in delay-100">
-            <div className="flex items-center gap-3 text-ink-light">
-              <div className="h-px bg-warm-200 flex-1"></div>
-              <span className="text-xs font-bold uppercase tracking-widest">Knowledge Base</span>
-              <div className="h-px bg-warm-200 flex-1"></div>
-            </div>
-
-            {documents.length > 0 ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {documents.map((doc, idx) => (
-                  <div
-                    key={idx}
-                    className="group flex items-start gap-4 p-5 bg-white rounded-2xl border border-warm-100 hover:border-accent/30 hover:shadow-lg hover:shadow-warm-200/50 transition-all duration-300"
-                  >
-                    {/* PDF Preview Icon */}
-                    <div className="relative w-12 h-16 bg-gradient-to-br from-red-50 to-red-100 rounded-lg border border-red-200 flex-shrink-0 flex items-center justify-center shadow-sm">
-                      <Icons.FileText className="w-6 h-6 text-red-500" />
-                      <div className="absolute -bottom-1 -right-1 bg-red-500 text-white text-[8px] font-bold px-1 rounded">PDF</div>
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <h3 className="font-display font-medium text-ink text-sm truncate" title={doc.filename}>
-                        {doc.filename}
-                      </h3>
-                      <div className="flex items-center gap-3 mt-2 text-xs text-ink-light">
-                        <span className="flex items-center gap-1">
-                          <Icons.Database className="w-3 h-3" />
-                          {doc.chunks} chunks
-                        </span>
-                        <span className="font-mono text-ink-faint">{doc.hash}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="text-center py-12 bg-warm-50/50 rounded-2xl border border-dashed border-warm-200">
-                <Icons.Upload className="w-12 h-12 text-warm-300 mx-auto mb-4" />
-                <p className="text-ink-light mb-2">No documents uploaded yet</p>
-                <button
-                  onClick={onNavigateToIngest}
-                  className="text-accent hover:text-accent-hover font-medium text-sm"
-                >
-                  Upload a PDF to get started
-                </button>
-              </div>
-            )}
-          </div>
-        )}
       </div>
 
       {/* ERROR SECTION */}
@@ -318,15 +321,17 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
 
       {/* OUTPUT SECTION */}
       {data && (
-        <div className="w-full max-w-4xl mx-auto animate-fade-in pb-12">
+        <div className="w-full max-w-5xl mx-auto animate-fade-in pb-12">
           <div className="bg-surface rounded-3xl border border-warm-100 shadow-2xl shadow-warm-200/40 p-10 md:p-14 space-y-12 relative overflow-hidden">
 
             {/* Decorative top bar */}
             <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-accent via-orange-400 to-warm-300"></div>
 
             {/* Header with Quality Score and Explain Button */}
-            <div className="flex justify-between items-center border-b border-warm-100 pb-6 flex-wrap gap-3">
-              <div className="flex items-center gap-3 flex-wrap">
+            <div className="flex justify-between items-start border-b border-warm-100 pb-6 flex-wrap gap-4">
+              <div>
+                <h3 className="text-2xl font-display font-bold text-ink mb-3">Generated Question</h3>
+                <div className="flex items-center gap-3 flex-wrap">
                 <span className="bg-ink text-white px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider shadow-md shadow-ink/20">
                   {data.data.difficulty_rating}
                 </span>
@@ -335,22 +340,24 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
                     Quality: {data.data.quality_score}/10
                   </span>
                 )}
-                {/* STEP 4: Explain Button */}
+                <span className="text-xs font-mono text-ink-faint flex items-center gap-1">
+                  <Icons.Activity className="w-3 h-3" />
+                  {data.meta.duration_seconds}s
+                </span>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
                 {data.data.question_id && (
                   <button
                     onClick={handleExplain}
-                    className="flex items-center gap-2 px-3 py-1 bg-accent/10 hover:bg-accent/20 border border-accent/30 hover:border-accent rounded-full text-xs font-medium text-accent transition-all"
+                    className="flex items-center gap-2 px-4 py-2 bg-accent/10 hover:bg-accent/20 border border-accent/30 hover:border-accent rounded-xl text-sm font-medium text-accent transition-all"
                     title="View provenance and source documents"
                   >
-                    <Icons.Book className="w-3 h-3" />
+                    <Icons.Book className="w-4 h-4" />
                     Explain
                   </button>
                 )}
               </div>
-              <span className="text-xs font-mono text-ink-faint flex items-center gap-1">
-                <Icons.Activity className="w-3 h-3" />
-                {data.meta.duration_seconds}s
-              </span>
             </div>
 
             {/* Source References */}
@@ -397,9 +404,12 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
             )}
 
             {/* Question */}
-            <div className="relative">
-              <Icons.FileText className="absolute -left-8 top-1 w-6 h-6 text-warm-200 hidden md:block" />
-              <div className="prose prose-lg max-w-none">
+            <div className="relative bg-warm-50/50 rounded-2xl p-8 border border-warm-100">
+              <div className="flex items-center gap-2 text-accent mb-4">
+                <Icons.FileText className="w-5 h-5" />
+                <span className="text-sm font-bold uppercase tracking-wide">Question</span>
+              </div>
+              <div className="prose prose-lg max-w-none text-ink">
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   components={markdownComponents}
@@ -409,54 +419,29 @@ const GenerationModule: React.FC<GenerationModuleProps> = ({
               </div>
             </div>
 
-            {/* Verification Code */}
-            {data.data.verification_code && (
-              <div className="space-y-3 bg-warm-50 p-2 rounded-2xl border border-warm-100">
-                <div className="flex items-center gap-2 px-4 pt-3 text-ink-light">
-                  <Icons.Terminal className="w-4 h-4" />
-                  <span className="text-xs font-bold uppercase tracking-wide">Verification Code</span>
-                </div>
-                <CodeViewer code={data.data.verification_code} />
-              </div>
-            )}
-
             {/* Answer & Explanation */}
-            <div className="grid grid-cols-1 gap-10">
-              <div className="space-y-4">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div className="bg-green-50/50 rounded-2xl p-6 border border-green-100">
                 <div className="flex items-center gap-2 text-accent">
-                  <div className="p-1 bg-accent-soft rounded-md">
-                    <Icons.Check className="w-5 h-5" />
-                  </div>
+                  <Icons.Check className="w-5 h-5 text-green-600" />
                   <span className="text-sm font-bold uppercase tracking-wide">Computed Answer</span>
                 </div>
-                <div className="text-xl text-ink font-medium pl-4 md:pl-0 leading-relaxed">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    components={{
-                      ...markdownComponents,
-                      p: ({ children }: any) => <span className="font-mono">{children}</span>,
-                    }}
-                  >
-                    {data.data.computed_answer || data.data.answer}
-                  </ReactMarkdown>
-                </div>
+                <div className="text-2xl text-green-700 font-bold mt-4">{data.data.computed_answer || data.data.answer}</div>
               </div>
 
-              <div className="bg-warm-50/80 rounded-2xl p-8 border border-warm-100 relative group hover:bg-warm-50 transition-colors">
-                 <div className="absolute top-6 left-6 w-1 h-8 bg-warm-200 rounded-full group-hover:bg-accent transition-colors"></div>
-                 <div className="pl-6">
-                    <div className="flex items-center gap-2 text-ink-light mb-3">
-                      <span className="text-xs font-bold uppercase tracking-wide">Explanation</span>
-                    </div>
-                    <div className="prose max-w-none">
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        components={markdownComponents}
-                      >
-                        {data.data.explanation}
-                      </ReactMarkdown>
-                    </div>
-                 </div>
+              <div className="bg-blue-50/50 rounded-2xl p-6 border border-blue-100">
+                <div className="flex items-center gap-2 text-blue-600 mb-3">
+                  <Icons.Book className="w-5 h-5" />
+                  <span className="text-sm font-bold uppercase tracking-wide">Explanation</span>
+                </div>
+                <div className="prose prose-sm max-w-none text-ink-light">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={markdownComponents}
+                  >
+                    {data.data.explanation}
+                  </ReactMarkdown>
+                </div>
               </div>
             </div>
 
