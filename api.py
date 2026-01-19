@@ -280,7 +280,10 @@ async def get_suggestions():
         # Check what PDFs actually exist in uploads folder
         existing_pdfs = list(UPLOAD_DIR.glob("*.pdf"))
 
+        logger.info(f"[Suggestions] Found {len(existing_pdfs)} PDFs, {len(ingested_docs)} ingested docs")
+
         if not existing_pdfs:
+            logger.warning("[Suggestions] No PDFs found in uploads folder")
             return {"suggestions": [], "message": "No PDFs uploaded yet"}
 
         suggestions = []
@@ -296,64 +299,117 @@ async def get_suggestions():
             if topic and len(topic) > 2 and topic.lower() not in seen:
                 seen.add(topic.lower())
                 suggestions.append({"topic": topic.title(), "examples": []})
+                logger.debug(f"[Suggestions] Added from filename: {topic.title()}")
 
         # 2. Search PDF content with diverse queries to find more topics
         if ingested_docs:
-            rag = get_rag_service()
+            logger.info(f"[Suggestions] Searching content in {len(ingested_docs)} docs")
             try:
-                # Multiple search queries to find diverse topics
-                search_queries = [
-                    "algorithm definition",
-                    "theorem proof",
-                    "formula calculation",
-                    "example problem",
-                    "key concepts",
-                    "introduction overview",
-                    "method technique approach"
-                ]
-
-                all_content = ""
-                for query in search_queries:
-                    try:
-                        result = rag.search(query, k=5)
-                        if result:
-                            all_content += " " + result
-                    except:
-                        pass
-
-                if all_content:
-                    text = all_content.lower()
-
-                    # Expanded list of potential topics to look for
-                    potential_topics = [
-                        # ML/AI
-                        "decision tree", "random forest", "neural network", "deep learning",
-                        "entropy", "gini index", "information gain", "id3 algorithm", "c4.5",
-                        "classification", "clustering", "regression", "prediction",
-                        "gradient descent", "backpropagation", "perceptron", "mlp",
-                        "naive bayes", "svm", "support vector machine", "knn", "k-nearest",
-                        "cross validation", "overfitting", "underfitting", "regularization",
-                        "pruning", "boosting", "bagging", "ensemble methods", "adaboost",
-                        "activation function", "loss function", "cost function", "optimization",
-                        "feature selection", "dimensionality reduction", "pca",
-                        "reinforcement learning", "q-learning", "markov decision",
-                        "convolutional neural", "recurrent neural", "lstm", "transformer",
-                        # AI/Agents
-                        "rational agent", "intelligent agent", "search algorithm",
-                        "heuristic search", "a* algorithm", "minimax", "alpha beta",
-                        "constraint satisfaction", "game theory", "utility function",
-                        # Data structures/Algorithms
-                        "binary tree", "graph algorithm", "sorting algorithm",
-                        "dynamic programming", "greedy algorithm", "divide and conquer",
-                        "time complexity", "space complexity", "big o notation",
-                        # Math/Stats
-                        "probability", "bayesian", "conditional probability",
-                        "hypothesis testing", "confidence interval", "correlation",
-                        "linear algebra", "matrix multiplication", "eigenvalue"
+                rag = get_rag_service()
+                logger.info(f"[Suggestions] RAG service initialized: {rag is not None}")
+            except Exception as rag_init_err:
+                logger.error(f"[Suggestions] RAG service initialization failed: {rag_init_err}")
+                rag = None
+            
+            all_content = ""
+            
+            if rag:
+                try:
+                    # Multiple search queries to find diverse topics
+                    search_queries = [
+                        "algorithm",
+                        "definition",
+                        "formula",
+                        "example",
+                        "method",
+                        "process",
+                        "technique"
                     ]
 
+                    for query in search_queries:
+                        try:
+                            result = rag.search(query, k=3)
+                            if result and isinstance(result, str) and len(result) > 50:
+                                all_content += " " + result
+                                logger.info(f"[Suggestions] Found {len(result)} chars for query: {query}")
+                            else:
+                                logger.debug(f"[Suggestions] Empty/short result for query: {query}")
+                        except Exception as search_err:
+                            logger.warning(f"[Suggestions] Search failed for '{query}': {search_err}")
+                            continue
+                except Exception as search_loop_err:
+                    logger.error(f"[Suggestions] Search loop failed: {search_loop_err}")
+
+            logger.info(f"[Suggestions] Extracted {len(all_content)} chars of content")
+            
+            # Fallback: Try direct ChromaDB query if RAG search failed
+            if not all_content or len(all_content) < 100:
+                logger.warning("[Suggestions] RAG search returned insufficient content, trying direct ChromaDB query")
+                try:
+                    from app.rag import get_rag_engine
+                    rag_engine = get_rag_engine()
+                    # Get some sample documents
+                    sample_result = rag_engine.query_knowledge_base("topics concepts", k=10)
+                    if sample_result and sample_result.context:
+                        all_content = sample_result.context
+                        logger.info(f"[Suggestions] Direct ChromaDB query returned {len(all_content)} chars")
+                except Exception as direct_err:
+                    logger.error(f"[Suggestions] Direct ChromaDB query also failed: {direct_err}")
+
+            if all_content and len(all_content) > 100:
+                try:
+                    text = all_content.lower()
+                    
+                    import re
+
+                    # Expanded and organized list of potential topics to look for
+                    potential_topics = [
+                        # ML/AI Core
+                        "machine learning", "artificial intelligence", "deep learning",
+                        "supervised learning", "unsupervised learning", "reinforcement learning",
+                        # Decision Trees
+                        "decision tree", "random forest", "id3 algorithm", "c4.5 algorithm", "cart",
+                        "entropy", "gini index", "information gain", "gain ratio", "pruning",
+                        # Classification
+                        "classification", "naive bayes", "svm", "support vector machine",
+                        "knn", "k-nearest neighbors", "logistic regression",
+                        # Neural Networks
+                        "neural network", "perceptron", "backpropagation", "mlp",
+                        "activation function", "loss function", "gradient descent",
+                        "cnn", "convolutional", "rnn", "recurrent", "lstm", "transformer",
+                        # Clustering
+                        "clustering", "k-means", "hierarchical clustering", "dbscan",
+                        # Model Evaluation
+                        "cross validation", "confusion matrix", "accuracy", "precision", "recall",
+                        "overfitting", "underfitting", "regularization", "bias variance",
+                        # Ensemble
+                        "ensemble", "bagging", "boosting", "adaboost", "gradient boosting",
+                        # Features
+                        "feature selection", "dimensionality reduction", "pca",
+                        "normalization", "standardization",
+                        # AI/Agents
+                        "rational agent", "intelligent agent", "reflex agent", "peas",
+                        "search algorithm", "uninformed search", "informed search",
+                        "heuristic", "a* algorithm", "minimax", "alpha beta pruning",
+                        "constraint satisfaction", "game tree", "adversarial search",
+                        # Search
+                        "breadth first search", "bfs", "depth first search", "dfs",
+                        "uniform cost search", "greedy best first", "hill climbing",
+                        # Algorithms
+                        "dynamic programming", "greedy algorithm", "divide and conquer",
+                        "sorting algorithm", "binary search", "graph algorithm",
+                        "time complexity", "space complexity", "big o notation",
+                        # Stats
+                        "probability", "bayes theorem", "conditional probability",
+                        "hypothesis testing", "confidence interval", "correlation"
+                    ]
+
+                    logger.info(f"[Suggestions] Searching {len(potential_topics)} topics in {len(text)} chars")
+                    
                     for term in potential_topics:
-                        if term in text and term.lower() not in seen:
+                        # Use word boundary regex for better matching
+                        pattern = r'\b' + re.escape(term) + r'\b'
+                        if re.search(pattern, text) and term.lower() not in seen:
                             seen.add(term.lower())
                             # Generate example question types
                             examples = []
@@ -372,16 +428,22 @@ async def get_suggestions():
                         if len(suggestions) >= 20:
                             break
 
-            except Exception as e:
-                logger.warning(f"Could not extract topics from content: {e}")
+                except Exception as e:
+                    logger.warning(f"[Suggestions] Could not extract topics from content: {e}")
 
         # Sort suggestions: filename-based first, then alphabetically
         suggestions.sort(key=lambda x: (0 if x['examples'] == [] else 1, x['topic']))
 
-        return {"suggestions": suggestions[:15]}
+        final_suggestions = suggestions[:15]
+        logger.info(f"[Suggestions] Returning {len(final_suggestions)} suggestions")
+        
+        return {"suggestions": final_suggestions}
     except Exception as e:
-        logger.error(f"Failed to get suggestions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[Suggestions] Failed to get suggestions: {e}")
+        import traceback
+        logger.error(f"[Suggestions] Traceback: {traceback.format_exc()}")
+        # Return empty array instead of error to keep UI working
+        return {"suggestions": [], "error": str(e)}
 
 @app.get("/api/v1/bloom-levels")
 async def get_bloom_levels():

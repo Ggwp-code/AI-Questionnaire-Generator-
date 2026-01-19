@@ -434,8 +434,19 @@ class EnterpriseRAGService:
         return self._engine
 
     def search(self, query: str, k: int = 5) -> str:
-        context, _, _ = self.retriever.retrieve(query)
-        return context
+        """Simple search that returns context text"""
+        try:
+            # Direct call to engine for simple queries
+            result = self.engine.query_knowledge_base(query, k=k)
+            if result and result.context:
+                logger.debug(f"[RAG Search] Found {len(result.context)} chars for '{query}'")
+                return result.context
+            else:
+                logger.warning(f"[RAG Search] Empty result for '{query}'")
+                return ""
+        except Exception as e:
+            logger.error(f"[RAG Search] Failed for '{query}': {e}")
+            return ""
 
     def search_with_metadata(self, query: str, k: int = 5) -> Tuple[str, List[int], str]:
         """Returns (context, page_numbers, filename)"""
