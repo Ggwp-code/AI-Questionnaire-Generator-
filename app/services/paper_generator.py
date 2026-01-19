@@ -25,8 +25,11 @@ logger = get_logger("PaperGenerator")
 # Storage paths
 TEMPLATES_DIR = Path("data/paper_templates")
 PAPERS_DIR = Path("data/generated_papers")
-TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
-PAPERS_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    PAPERS_DIR.mkdir(parents=True, exist_ok=True)
+except (FileExistsError, OSError):
+    pass  # Directories already exist
 
 
 @dataclass
@@ -293,8 +296,8 @@ class PaperGeneratorService:
         results = {}  # (section_idx, question_number) -> GeneratedQuestion
 
         if parallel and total_questions > 1:
-            # Limit to 3 parallel to avoid API rate limits
-            with ThreadPoolExecutor(max_workers=min(3, total_questions)) as executor:
+            # Use 5 parallel workers for faster generation with GPT-4o
+            with ThreadPoolExecutor(max_workers=min(5, total_questions)) as executor:
                 futures = {
                     executor.submit(
                         self._generate_single_question,

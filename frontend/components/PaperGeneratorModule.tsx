@@ -137,10 +137,19 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
   const fetchSuggestions = async () => {
     setLoadingSuggestions(true);
     try {
+      console.log('[Suggestions] Fetching suggestions from API...');
       const suggs = await getSuggestions();
-      setSuggestions(suggs);
+      console.log('[Suggestions] Received:', suggs);
+      if (Array.isArray(suggs) && suggs.length > 0) {
+        setSuggestions(suggs);
+        console.log('[Suggestions] Set', suggs.length, 'suggestions');
+      } else {
+        console.warn('[Suggestions] Received empty or invalid suggestions:', suggs);
+        setSuggestions([]);
+      }
     } catch (err) {
-      console.error('Failed to fetch suggestions:', err);
+      console.error('[Suggestions] Failed to fetch suggestions:', err);
+      setSuggestions([]);
     }
     setLoadingSuggestions(false);
   };

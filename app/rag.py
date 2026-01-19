@@ -123,17 +123,31 @@ class VectorStore:
     def __init__(self, persist_directory: str = "chroma_db"):
         self.persist_directory = persist_directory
         self.logger = get_logger("VectorStore")
-        self.embedding_function = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'}
-        )
-        self.db = Chroma(
-            persist_directory=self.persist_directory,
-            embedding_function=self.embedding_function
-        )
+        try:
+            self.embedding_function = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'}
+            )
+            # Initialize Chroma with explicit client settings to avoid tenant issues
+            from chromadb.config import Settings
+            self.db = Chroma(
+                persist_directory=self.persist_directory,
+                embedding_function=self.embedding_function,
+                client_settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to initialize vector store: {e}")
+            self.db = None
+            self.embedding_function = None
     
     def store_chunks(self, chunks: List[Document]) -> int:
         if not chunks: return 0
+        if not self.db:
+            self.logger.warning("Vector store not available. Skipping chunk storage.")
+            return 0
         batch_size = 50
         
         # Prepare pure Python lists (str and dict) to bypass Document object serialization issues
@@ -171,14 +185,18 @@ class VectorStore:
             self.logger.error(f"Storage failed: {e}")
             raise
 
-    def get_database(self) -> Chroma:
+    def get_database(self):
         return self.db
     
     def get_collection_stats(self) -> Dict:
+        if not self.db:
+            return {"total_vectors": 0, "status": "not_initialized"}
         try:
-            return {"total_vectors": self.db._collection.count()}
-        except:
-            return {"total_vectors": 0}
+            count = self.db._collection.count()
+            return {"total_vectors": count, "status": "active"}
+        except Exception as e:
+            self.logger.warning(f"Could not get collection stats: {e}")
+            return {"total_vectors": 0, "status": "error"}
 
 class RAGEngine:
     def __init__(self, chunk_strategy: ChunkStrategy = ChunkStrategy.MEDIUM):
@@ -220,12 +238,15 @@ class RAGEngine:
     def query_knowledge_base(self, topic: str, k: int = 3) -> RetrievalResult:
         try:
             db = self.vector_store.get_database()
+            if not db:
+                return RetrievalResult("", [], [], topic)
             results = db.similarity_search_with_score(topic, k=k)
             docs = [doc for doc, _ in results]
             scores = [score for _, score in results]
             context = "\n\n".join([d.page_content for d in docs])
             return RetrievalResult(context, docs, scores, topic)
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"Query failed: {e}")
             return RetrievalResult("", [], [], topic)
 
     def get_statistics(self) -> Dict:

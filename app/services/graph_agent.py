@@ -102,14 +102,21 @@ def get_llm(json_mode=False, mode="auto"):
     if cache_key in _llm_cache:
         return _llm_cache[cache_key]
 
-    model_map = {"instant": "gpt-5-nano", "auto": "gpt-5-mini", "thinking": "gpt-5-mini"}
-    selected = model_map.get(mode, "gpt-5-mini")
+    # Updated to use faster, production-ready GPT-4 models
+    # instant: Fast responses for simple tasks (bloom detection, tagging)
+    # auto: Balanced speed/quality for main generation
+    # thinking: Complex reasoning (code generation, review)
+    model_map = {"instant": "gpt-4o-mini", "auto": "gpt-4o", "thinking": "gpt-4-turbo"}
+    selected = model_map.get(mode, "gpt-4o")
 
-    # GPT-5 models only support temperature=1 (must be explicit, default is 0.7)
+    # Set appropriate temperature based on task
+    temp_map = {"instant": 0.7, "auto": 0.8, "thinking": 0.9}
+    temperature = temp_map.get(mode, 0.8)
+
     llm = ChatOpenAI(
         model=selected,
         api_key=api_key,
-        temperature=1,
+        temperature=temperature,
         request_timeout=120
     )
 
