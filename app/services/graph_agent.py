@@ -360,6 +360,12 @@ class AgentState(TypedDict):
     # PEDAGOGY TAGGER FIELDS (Step 3)
     course_outcome: Optional[str]  # CO1, CO2, etc.
     program_outcome: Optional[str]  # PO1, PO2, etc.
+    # PROVENANCE FIELDS (Step 4)
+    question_id: Optional[int]  # Database ID after saving (for explainability)
+    # GUARDIAN FIELDS (Step 5)
+    guardian_validated: bool  # True if Guardian approved the question
+    guardian_attempt_count: int  # Number of Guardian validation attempts (max 1 regeneration)
+    guardian_failure_reason: Optional[str]  # Why Guardian rejected the question
 
 # --- NODES ---
 
@@ -1648,6 +1654,55 @@ Return structured JSON with: course_outcome, program_outcome, reasoning"""
         else:
             return {'course_outcome': 'CO3', 'program_outcome': 'PO2'}
 
+# --- STEP 5: GUARDIAN SYLLABUS VALIDATOR ---
+
+from app.services.guardian import get_guardian
+
+@timed_node("guardian")
+def validate_syllabus(state: AgentState) -> Dict:
+    """
+    STEP 5: Guardian Validator
+
+    Validates that the generated question aligns with the course syllabus.
+    - Checks if topic is in syllabus
+    - Finds unit alignment
+    - Allows ONE regeneration attempt if validation fails
+
+    Backward Compatible: If Guardian is disabled (config), validation passes automatically.
+    """
+    guardian = get_guardian()
+
+    # If Guardian is disabled, pass validation automatically
+    if not guardian.is_enabled():
+        logger.info("[Guardian] Disabled - skipping validation")
+        return {
+            'guardian_validated': True,
+            'guardian_failure_reason': None
+        }
+
+    topic = state.get('topic', '')
+    bloom_level = state.get('bloom_level')
+    attempt_count = state.get('guardian_attempt_count', 0)
+
+    # Validate topic against syllabus
+    is_valid, reason, unit_num = guardian.validate_topic(topic, bloom_level)
+
+    if is_valid:
+        logger.info(f"[Guardian] ✓ Question approved (Topic: {topic}, Unit: {unit_num})")
+        return {
+            'guardian_validated': True,
+            'guardian_failure_reason': None
+        }
+    else:
+        # Increment attempt count for retry logic
+        new_attempt_count = attempt_count + 1
+        logger.warning(f"[Guardian] ✗ Question rejected: {reason} (Attempt: {new_attempt_count})")
+        return {
+            'guardian_validated': False,
+            'guardian_failure_reason': reason,
+            'guardian_attempt_count': new_attempt_count
+        }
+
 @timed_node("archivist")
 def save_result(state: AgentState) -> Dict:
     if not state.get('verification_passed'): return {}
@@ -1657,7 +1712,7 @@ def save_result(state: AgentState) -> Dict:
         logger.info("[CACHE] Skipping save - question was from cache")
         return {}
     if q and 'question' in q:
-        save_template(
+        question_id = save_template(
             state['topic'],
             state['target_difficulty'],
             q['question'],
@@ -1666,6 +1721,9 @@ def save_result(state: AgentState) -> Dict:
             full_data=q,
             source_urls=state.get('source_urls', [])
         )
+        if question_id:
+            # Store question ID in state for API response
+            return {'question_id': question_id}
     return {}
 
 def build_graph():
@@ -1685,6 +1743,7 @@ def build_graph():
     workflow.add_node("question_author", generate_question_from_result)
     workflow.add_node("reviewer", parallel_review)  # PARALLEL: runs critic + validator together
     workflow.add_node("pedagogy_tagger", tag_pedagogy)  # STEP 3: Tag with CO/PO after review
+    workflow.add_node("guardian", validate_syllabus)  # STEP 5: Syllabus validator
     workflow.add_node("fallback", use_fallback)
     workflow.add_node("archivist", save_result)
 
@@ -1759,21 +1818,58 @@ def build_graph():
         if state.get('answer_mismatch'):
             return "retry"
 
-        # STEP 3: Route through pedagogy_tagger if enabled, otherwise go to save
+        # STEP 3: Route through pedagogy_tagger if enabled, otherwise go to Guardian
         tagger_enabled = os.getenv("ENABLE_PEDAGOGY_TAGGER", "false").lower() == "true"
         if tagger_enabled:
             return "tag"
         else:
-            return "save"
+            # STEP 5: Go to Guardian validator
+            return "guardian"
 
     workflow.add_conditional_edges(
         "reviewer",
         route_after_review,
-        {"fallback": "fallback", "retry": "code_author", "tag": "pedagogy_tagger", "save": "archivist"}
+        {"fallback": "fallback", "retry": "code_author", "tag": "pedagogy_tagger", "guardian": "guardian"}
     )
 
-    # STEP 3: Pedagogy Tagger -> Archivist (always after tagging)
-    workflow.add_edge("pedagogy_tagger", "archivist")
+    # STEP 3: Pedagogy Tagger -> Guardian (STEP 5)
+    workflow.add_edge("pedagogy_tagger", "guardian")
+
+    # STEP 5: Guardian Validator -> Route based on validation result
+    def route_after_guardian(state):
+        """
+        Route after Guardian validation:
+        - If Guardian disabled or validated: go to save
+        - If Guardian rejected and attempts < 1: retry generation
+        - Otherwise: go to save (exhausted attempts)
+        """
+        guardian_enabled = os.getenv("ENABLE_GUARDIAN", "false").lower() == "true"
+
+        # If Guardian disabled, always save
+        if not guardian_enabled:
+            return "save"
+
+        is_validated = state.get('guardian_validated', True)
+        attempt_count = state.get('guardian_attempt_count', 0)
+
+        # If validated, save the question
+        if is_validated:
+            return "save"
+
+        # If not validated and we haven't retried yet, allow ONE regeneration
+        if attempt_count < 1:
+            logger.warning(f"[Guardian] Attempting regeneration (attempt {attempt_count + 1}/1)")
+            return "retry"
+
+        # Exhausted attempts, save anyway (or could reject - for now we save with warning)
+        logger.warning("[Guardian] Max regeneration attempts reached. Proceeding to save.")
+        return "save"
+
+    workflow.add_conditional_edges(
+        "guardian",
+        route_after_guardian,
+        {"save": "archivist", "retry": "code_author"}
+    )
 
     workflow.add_edge("fallback", "archivist")
     workflow.add_edge("archivist", END)
@@ -1859,7 +1955,11 @@ def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None)
             "retrieved_doc_ids": [],
             # STEP 3: Pedagogy Tagger initialization
             "course_outcome": None,
-            "program_outcome": None
+            "program_outcome": None,
+            # STEP 5: Guardian initialization
+            "guardian_validated": False,
+            "guardian_attempt_count": 0,
+            "guardian_failure_reason": None
         }
 
         result = graph.invoke(initial_state)
@@ -1883,6 +1983,9 @@ def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None)
             # STEP 3: Add Pedagogy tags
             final_data['course_outcome'] = result.get('course_outcome')
             final_data['program_outcome'] = result.get('program_outcome')
+
+            # STEP 4: Add question ID for provenance
+            final_data['question_id'] = result.get('question_id')
 
             # Auto-tag the question
             question_type = final_data.get('question_type', '')

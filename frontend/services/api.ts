@@ -6,7 +6,8 @@ import {
   PaperCreateResponse,
   PaperGenerateResponse,
   GeneratedPaper,
-  TopicSuggestion
+  TopicSuggestion,
+  ProvenanceData
 } from '../types';
 
 // Configuration: Point this to your Python/Node/Go backend
@@ -635,6 +636,34 @@ export const reloadConfig = async (): Promise<void> => {
     }
   } catch (error: any) {
     console.error(`[API] Failed to reload config:`, error);
+    throw error;
+  }
+};
+
+// =============================================================================
+// PROVENANCE & EXPLAINABILITY (STEP 4)
+// =============================================================================
+
+/**
+ * ENDPOINT: GET /question/{question_id}/explain
+ * Description: Get provenance data for a question (bloom level, CO/PO, source documents)
+ * READ-ONLY - no regeneration allowed
+ */
+export const explainQuestion = async (questionId: number): Promise<ProvenanceData> => {
+  try {
+    console.log(`[API] Fetching provenance for question ${questionId}...`);
+    const response = await fetch(`${API_BASE}/question/${questionId}/explain`);
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error('Question not found');
+      }
+      throw new Error(`Server error: ${response.status}`);
+    }
+
+    return response.json();
+  } catch (error: any) {
+    console.error(`[API] Failed to fetch provenance:`, error);
     throw error;
   }
 };
