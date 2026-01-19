@@ -120,6 +120,8 @@ def get_existing_template(topic: str, difficulty: str) -> Optional[Dict[str, Any
                 return ""
 
         base = {
+            "id": row['id'],  # Include database ID for tracking
+            "cache_id": str(row['id']),  # String version for set operations
             "question_text": get_safe('question_text'),
             "python_code": get_safe('verification_code'),
             "answer": get_safe('answer_text'),
@@ -132,6 +134,9 @@ def get_existing_template(topic: str, difficulty: str) -> Optional[Dict[str, Any
             try:
                 extra = json.loads(json_data)
                 base.update(extra)
+                # Ensure ID is preserved even if json has it
+                base['id'] = row['id']
+                base['cache_id'] = str(row['id'])
             except:
                 pass
         return base
@@ -185,6 +190,8 @@ def find_similar_questions(topic: str, difficulty: str = None, limit: int = 5) -
 
             if score > 0.3:  # Threshold for similarity
                 base = {
+                    "id": row['id'],  # Include database ID for tracking
+                    "cache_id": str(row['id']),  # String version for set operations
                     "topic": row['topic'],
                     "difficulty": row['difficulty'],
                     "question_text": row['question_text'] or "",
@@ -200,7 +207,10 @@ def find_similar_questions(topic: str, difficulty: str = None, limit: int = 5) -
                     try:
                         extra = json.loads(json_data)
                         base.update(extra)
-                        base['similarity_score'] = score  # Ensure score preserved
+                        # Ensure ID and score are preserved
+                        base['id'] = row['id']
+                        base['cache_id'] = str(row['id'])
+                        base['similarity_score'] = score
                     except:
                         pass
 

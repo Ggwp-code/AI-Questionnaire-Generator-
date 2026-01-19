@@ -405,6 +405,9 @@ class AgentState(TypedDict):
     guardian_validated: bool  # True if Guardian approved the question
     guardian_attempt_count: int  # Number of Guardian validation attempts (max 1 regeneration)
     guardian_failure_reason: Optional[str]  # Why Guardian rejected the question
+    # DEDUPLICATION FIELDS
+    used_cache_ids: set  # Track which cached questions have been used in this paper
+    temperature_boost: float  # Temperature adjustment for retries
 
 # --- NODES ---
 
@@ -1623,13 +1626,24 @@ The question should be appropriate for the difficulty level specified."""
 
 @timed_node("use_cache")
 def use_cached_question(state: AgentState) -> Dict:
-    """Use a cached question from the question bank instead of generating new."""
+    """
+    Use a cached question from the question bank instead of generating new.
+    Checks if cached question was already used in this paper to prevent duplicates.
+    """
     cached = state.get('cached_question')
     if not cached:
         logger.warning("[CACHE] No cached question found, falling back to generation")
         return {'use_fallback': True}
 
-    logger.info(f"[CACHE] Using cached question (similarity: {cached.get('similarity_score', 0):.2f})")
+    # Check if this cached question was already used in this paper
+    cache_id = cached.get('id') or cached.get('cache_id')
+    used_cache_ids = state.get('used_cache_ids', set())
+
+    if cache_id and cache_id in used_cache_ids:
+        logger.warning(f"[CACHE] Cached question #{cache_id} already used in this paper. Forcing new generation.")
+        return {'use_fallback': True, 'cached_question': None}  # Clear cache and generate new
+
+    logger.info(f"[CACHE] Using cached question #{cache_id} (similarity: {cached.get('similarity_score', 0):.2f})")
 
     # Convert cached format to question_data format
     question_data = {
@@ -1638,6 +1652,7 @@ def use_cached_question(state: AgentState) -> Dict:
         'explanation': cached.get('explanation', ''),
         'verification_code': cached.get('python_code') or cached.get('verification_code', ''),
         'from_cache': True,
+        'cache_id': cache_id,  # Include cache ID for tracking
         'cache_similarity': cached.get('similarity_score', 0)
     }
 
@@ -2003,7 +2018,18 @@ def rebuild_graph():
     _graph = None
     return get_graph()
 
-def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None):
+def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None,
+               used_cache_ids: set = None, temperature_boost: float = 0.0):
+    """
+    Run the question generation agent.
+
+    Args:
+        topic: The topic for the question
+        difficulty: Question difficulty level
+        question_type: Type of question (mcq, short, long, etc.)
+        used_cache_ids: Set of cache IDs already used in this paper (prevents reuse)
+        temperature_boost: Additional temperature to add for retry attempts (0.0 - 0.5)
+    """
     graph = get_graph()  # Use cached graph
     logger.info(f"Tribunal Engine Started for Topic: {topic}, Type: {question_type}")
 
@@ -2034,6 +2060,9 @@ def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None)
             "source_urls": [],
             "source_pages": [],
             "source_filename": None,
+            # Deduplication support
+            "used_cache_ids": used_cache_ids or set(),  # Track used cache IDs
+            "temperature_boost": temperature_boost,  # For retry temperature adjustment
             "detected_keywords": {},  # Keywords detected in query for targeted context
             "answer_mismatch": False,
             "answer_validation_count": 0,
