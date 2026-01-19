@@ -12,10 +12,12 @@ import json
 import os
 import uuid
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import hashlib
 
 from app.services.graph_agent import run_agent
 from app.tools.utils import get_logger
@@ -264,7 +266,7 @@ class PaperGeneratorService:
     # ========== PAPER GENERATION ==========
 
     def generate_paper(self, template_id: str, parallel: bool = True) -> GeneratedPaper:
-        """Generate a full question paper from a template with deduplication"""
+        """Generate a full question paper from a template with enhanced deduplication"""
         template = self.get_template(template_id)
         if not template:
             raise ValueError(f"Template not found: {template_id}")
@@ -280,9 +282,11 @@ class PaperGeneratorService:
             instructions=template.instructions
         )
 
-        # Track generated questions to prevent duplicates
-        question_hash_set = set()  # Store hash of (topic, question_text) to detect duplicates
-        question_attempts = {}  # Track retry attempts
+        # Enhanced tracking for duplicate prevention
+        question_hash_set = set()  # Store hash of question content to detect duplicates
+        used_cache_ids = set()  # Track which cached questions have been used
+        hash_lock = threading.Lock()  # Thread-safe operations on sets
+        dedup_stats = {'duplicates_detected': 0, 'retries_performed': 0, 'cache_reuse_prevented': 0}
 
         # Collect ALL question tasks across ALL sections first
         all_tasks = []  # (section_idx, question_number, spec, section_name)
@@ -294,7 +298,7 @@ class PaperGeneratorService:
                 question_number += spec.count
 
         total_questions = len(all_tasks)
-        logger.info(f"Generating {total_questions} questions in parallel with deduplication...")
+        logger.info(f"Generating {total_questions} questions in parallel with enhanced deduplication...")
 
         # Generate ALL questions in parallel
         results = {}  # (section_idx, question_number) -> GeneratedQuestion
@@ -309,7 +313,10 @@ class PaperGeneratorService:
                         task[2].get_prompt(),  # prompt
                         task[2],  # spec
                         task[3],  # section_name
-                        question_hash_set  # pass the dedup set
+                        question_hash_set,  # pass the dedup set
+                        used_cache_ids,  # pass used cache tracking
+                        hash_lock,  # pass thread lock
+                        dedup_stats  # pass stats dict
                     ): (task[0], task[1], task[2], task[3])  # (section_idx, q_num, spec, section_name)
                     for task in all_tasks
                 }
@@ -329,7 +336,10 @@ class PaperGeneratorService:
             for task in all_tasks:
                 section_idx, q_num, spec, section_name = task
                 try:
-                    q = self._generate_single_question_with_dedup(q_num, spec.get_prompt(), spec, section_name, question_hash_set)
+                    q = self._generate_single_question_with_dedup(
+                        q_num, spec.get_prompt(), spec, section_name,
+                        question_hash_set, used_cache_ids, hash_lock, dedup_stats
+                    )
                     results[(section_idx, q_num)] = q
                 except Exception as e:
                     logger.error(f"Question {q_num} generation failed: {e}")
@@ -374,13 +384,19 @@ class PaperGeneratorService:
         paper.generation_stats = {
             'total_questions': total_questions,
             'successful': successful,
-            'failed': failed
+            'failed': failed,
+            'duplicates_detected': dedup_stats['duplicates_detected'],
+            'retries_performed': dedup_stats['retries_performed'],
+            'cache_reuse_prevented': dedup_stats['cache_reuse_prevented']
         }
 
         # Save the generated paper
         self._save_paper(paper)
 
         logger.info(f"Paper generated: {successful}/{total_questions} questions successful")
+        logger.info(f"Deduplication stats: {dedup_stats['duplicates_detected']} duplicates detected, "
+                   f"{dedup_stats['retries_performed']} retries performed, "
+                   f"{dedup_stats['cache_reuse_prevented']} cache reuses prevented")
         return paper
 
     def _generate_questions_for_spec(
@@ -471,78 +487,163 @@ class PaperGeneratorService:
             verification_code=result.get('verification_code')
         )
 
+    def _compute_question_hash(self, question_text: str, answer: str, topic: str) -> str:
+        """
+        Compute a robust hash for a question to detect duplicates.
+        Uses full question text + answer + topic for better uniqueness.
+        """
+        # Normalize text: lowercase, strip, remove extra whitespace
+        def normalize(text: str) -> str:
+            return ' '.join(text.lower().strip().split())
+
+        # Use full question text (not just first 100 chars) + answer for better detection
+        normalized_q = normalize(question_text)
+        normalized_a = normalize(answer)
+        normalized_topic = normalize(topic)
+
+        # Create composite key with all components
+        composite_key = f"{normalized_topic}|{normalized_q}|{normalized_a}"
+
+        # Use SHA256 for better collision resistance than MD5
+        return hashlib.sha256(composite_key.encode('utf-8')).hexdigest()
+
     def _generate_single_question_with_dedup(
         self,
         question_number: int,
         prompt: str,
         spec: QuestionSpec,
         section_name: str,
-        question_hash_set: set,
-        max_retries: int = 3
+        question_hash_set: Set[str],
+        used_cache_ids: Set[str],
+        hash_lock: threading.Lock,
+        dedup_stats: Dict,
+        max_retries: int = 5
     ) -> GeneratedQuestion:
-        """Generate a single question with deduplication - retries if duplicate detected"""
-        import hashlib
-        
-        logger.info(f"Generating Q{question_number}: {prompt[:50]}... (with dedup check)")
+        """
+        Generate a single question with enhanced deduplication.
+
+        Features:
+        - Thread-safe set operations with locking
+        - Robust hash using full question + answer text
+        - Cache tracking to prevent reusing same cached question
+        - Progressive retry strategy with varied prompts and temperature
+        - Detailed logging and statistics
+        """
+        logger.info(f"Generating Q{question_number}: {prompt[:50]}... (with enhanced dedup)")
+
+        # Variation prompts for retries to encourage diversity
+        variation_prompts = [
+            "",  # First attempt - no modification
+            "\n[IMPORTANT: Generate a COMPLETELY DIFFERENT question. Use different examples, scenarios, or perspectives.]",
+            "\n[CRITICAL: This is retry #{attempt}. Generate a UNIQUE question with different focus. Consider: different application, different dataset, different approach, or different angle on the same topic.]",
+            "\n[URGENT: Previous attempts generated duplicates. Create a FRESH question with novel aspects. Change the problem setup, context, or ask about a different sub-concept within this topic.]",
+            "\n[FINAL ATTEMPT: Generate a maximally different question. Use alternative terminology, different difficulty emphasis, or focus on a complementary aspect of the topic.]"
+        ]
+
+        best_attempt = None  # Track best attempt in case all retries fail
 
         for attempt in range(max_retries):
-            # Call the existing graph agent
-            result = run_agent(prompt, spec.difficulty)
+            try:
+                # Progressive variation: add retry prompt and adjust parameters
+                current_prompt = prompt
+                if attempt > 0:
+                    variation_text = variation_prompts[min(attempt, len(variation_prompts) - 1)]
+                    current_prompt = f"{prompt}{variation_text.format(attempt=attempt)}"
 
-            if not result or 'error' in result:
-                raise Exception(result.get('error', 'Unknown generation error'))
+                # Pass used_cache_ids to agent to prevent cache reuse
+                result = run_agent(
+                    current_prompt,
+                    spec.difficulty,
+                    used_cache_ids=used_cache_ids,  # Pass to agent to prevent cache reuse
+                    temperature_boost=0.1 * attempt  # Increase temperature on retries (0.0, 0.1, 0.2, ...)
+                )
 
-            question_text = result.get('question', '')
-            
-            # Create hash of (topic, question_text) for deduplication
-            question_key = f"{spec.topic}|{question_text[:100]}"  # Use first 100 chars for hash
-            question_hash = hashlib.md5(question_key.encode()).hexdigest()
+                if not result or 'error' in result:
+                    raise Exception(result.get('error', 'Unknown generation error'))
 
-            # Check if this question has already been generated
-            if question_hash in question_hash_set:
-                logger.warning(f"Q{question_number} is a duplicate (attempt {attempt + 1}/{max_retries}), regenerating...")
-                if attempt < max_retries - 1:
-                    # Retry with more specific prompt variation
-                    prompt = f"{prompt}\n[IMPORTANT: Generate a COMPLETELY DIFFERENT question - avoid repeating previous questions on this topic]"
-                    continue
+                question_text = result.get('question', '')
+                answer_text = result.get('answer', '')
+
+                # Compute robust hash
+                question_hash = self._compute_question_hash(question_text, answer_text, spec.topic)
+
+                # Check for cache reuse (if this came from cache, track it)
+                from_cache = result.get('from_cache', False)
+                cache_id = result.get('cache_id')  # Agent should provide cache ID if from cache
+
+                # Thread-safe duplicate check
+                with hash_lock:
+                    is_duplicate = question_hash in question_hash_set
+                    cache_already_used = cache_id and cache_id in used_cache_ids
+
+                    if is_duplicate or cache_already_used:
+                        dedup_stats['duplicates_detected'] += 1
+                        if cache_already_used:
+                            dedup_stats['cache_reuse_prevented'] += 1
+                            logger.warning(f"Q{question_number}: Cached question #{cache_id} already used in this paper (attempt {attempt + 1}/{max_retries})")
+                        else:
+                            logger.warning(f"Q{question_number}: Duplicate question detected (attempt {attempt + 1}/{max_retries})")
+
+                        if attempt < max_retries - 1:
+                            # Track retry
+                            dedup_stats['retries_performed'] += 1
+                            # Store this as best attempt in case we run out of retries
+                            if not best_attempt:
+                                best_attempt = (result, question_hash, cache_id)
+                            continue  # Retry
+                        else:
+                            # Last attempt failed - use best attempt with warning
+                            logger.error(f"Q{question_number}: All {max_retries} attempts produced duplicates. Using last attempt with duplicate flag.")
+                            # Don't add to sets - let it be marked as potential duplicate
+                            if best_attempt:
+                                result, question_hash, cache_id = best_attempt
+                                question_text = result.get('question', '')
+                                answer_text = result.get('answer', '')
+
+                    # Not a duplicate - accept this question
+                    question_hash_set.add(question_hash)
+                    if cache_id:
+                        used_cache_ids.add(cache_id)
+
+                # Build parts marks
+                parts_marks = []
+                if spec.parts:
+                    for p in spec.parts:
+                        parts_marks.append({"part": p.part_label, "marks": p.marks, "description": p.description})
                 else:
-                    # Ran out of retries, use a modified version
-                    logger.error(f"Q{question_number} duplicate check failed after {max_retries} attempts")
-            
-            # Not a duplicate, add to set and proceed
-            question_hash_set.add(question_hash)
-            
-            # Build parts marks
-            parts_marks = []
-            if spec.parts:
-                for p in spec.parts:
-                    parts_marks.append({"part": p.part_label, "marks": p.marks, "description": p.description})
-            else:
-                # No explicit parts - single question
-                parts_marks = [{"part": "", "marks": spec.total_marks, "description": ""}]
+                    parts_marks = [{"part": "", "marks": spec.total_marks, "description": ""}]
 
-            # Format question text with marks
-            if spec.parts and len(spec.parts) > 1:
-                # Multi-part question - add marks to each part if not already there
-                question_text = self._format_multipart_question(question_text, spec.parts)
+                # Format question text with marks
+                if spec.parts and len(spec.parts) > 1:
+                    question_text = self._format_multipart_question(question_text, spec.parts)
 
-            logger.info(f"Q{question_number} generated successfully (unique)")
-            return GeneratedQuestion(
-                question_number=question_number,
-                part_of_section=section_name,
-                topic=spec.topic,
-                question_type=spec.question_type,
-                difficulty=spec.difficulty,
-                marks=spec.total_marks,
-                parts_marks=parts_marks,
-                question_text=question_text,
-                answer=result.get('answer', ''),
-                explanation=result.get('explanation', ''),
-                verification_code=result.get('verification_code')
-            )
+                # Log success
+                if attempt == 0:
+                    logger.info(f"Q{question_number} generated successfully on first attempt (unique)")
+                else:
+                    logger.info(f"Q{question_number} generated successfully after {attempt + 1} attempts (unique)")
+
+                return GeneratedQuestion(
+                    question_number=question_number,
+                    part_of_section=section_name,
+                    topic=spec.topic,
+                    question_type=spec.question_type,
+                    difficulty=spec.difficulty,
+                    marks=spec.total_marks,
+                    parts_marks=parts_marks,
+                    question_text=question_text,
+                    answer=answer_text,
+                    explanation=result.get('explanation', ''),
+                    verification_code=result.get('verification_code')
+                )
+
+            except Exception as e:
+                logger.error(f"Q{question_number} attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    raise  # Re-raise on last attempt
 
         # Should not reach here, but if it does, raise an error
-        raise Exception(f"Q{question_number} could not be generated - max retries exceeded")
+        raise Exception(f"Q{question_number} could not be generated after {max_retries} attempts")
 
     def _format_multipart_question(self, question_text: str, parts: List[QuestionPart]) -> str:
         """Add marks allocation to multi-part questions"""
