@@ -564,6 +564,13 @@ class PaperGeneratorService:
                 question_text = result.get('question', '')
                 answer_text = result.get('answer', '')
 
+                # Update used_cache_ids from agent result (deduplication tracking)
+                returned_cache_ids = result.get('used_cache_ids', [])
+                if returned_cache_ids:
+                    for cache_id in returned_cache_ids:
+                        used_cache_ids.add(cache_id)
+                    logger.info(f"Updated used_cache_ids with {len(returned_cache_ids)} IDs from agent result")
+
                 # Compute robust hash
                 question_hash = self._compute_question_hash(question_text, answer_text, spec.topic)
 

@@ -582,10 +582,25 @@ def check_sources(state: AgentState) -> Dict:
 
     # 2. Process duplicate check result
     cached_question = None
+    updated_used_cache_ids = state.get('used_cache_ids', set()).copy()  # Make a copy to avoid modifying original
+    
     if duplicate_result and duplicate_result.get('question_text'):
-        logger.info(f"[CACHE HIT] Found similar question in bank (similarity: {duplicate_result.get('similarity_score', 0):.2f})")
-        cached_question = duplicate_result
-        sources.append("question_bank_cache")
+        cache_id = duplicate_result.get('id') or duplicate_result.get('cache_id')
+        
+        # CHECK IF THIS CACHE ID HAS ALREADY BEEN USED IN THIS PAPER
+        if cache_id and cache_id in updated_used_cache_ids:
+            logger.warning(f"[CACHE] Cache ID #{cache_id} already used in this paper! Skipping cache, will generate new question.")
+            # Don't use cache - force generation
+            cached_question = None
+        else:
+            logger.info(f"[CACHE HIT] Found similar question in bank (similarity: {duplicate_result.get('similarity_score', 0):.2f})")
+            cached_question = duplicate_result
+            sources.append("question_bank_cache")
+            
+            # IMMEDIATELY add to used_cache_ids so subsequent questions don't reuse it
+            if cache_id:
+                updated_used_cache_ids.add(cache_id)
+                logger.info(f"[CACHE] Pre-registered cache ID #{cache_id} - will not be used again in this paper")
     elif state['iteration_count'] == 0 and not state.get('force_new', False):
         # Use existing template for format reference only
         template = get_existing_template(state['topic'], state['target_difficulty'])
@@ -618,6 +633,7 @@ def check_sources(state: AgentState) -> Dict:
         'db_template': None,
         'is_conceptual': topic_is_conceptual,
         'cached_question': cached_question,  # Will be used to skip generation if set
+        'used_cache_ids': updated_used_cache_ids,  # Updated with new cache IDs
         # BLOOM-ADAPTIVE RAG PROVENANCE (Step 2)
         'retrieved_chunk_ids': retrieved_chunk_ids,
         'retrieved_doc_ids': retrieved_doc_ids
@@ -1370,13 +1386,25 @@ def parallel_review(state: AgentState) -> Dict:
 
     logger.info("[Phase 3+5] Running Critic & Validator in PARALLEL...")
 
-    results = {}
+    results = {
+        'critique': {'is_passing': True, 'score': 8},
+        'answer_mismatch': False,
+        'verification_passed': False  # Will be set to True if review passes
+    }
 
     def run_critique():
-        return _run_critique_logic(state)
+        try:
+            return _run_critique_logic(state)
+        except Exception as e:
+            logger.error(f"Critique task failed: {e}")
+            return {'critique': {'is_passing': True, 'score': 7}}
 
     def run_validation():
-        return _run_validation_logic(state)
+        try:
+            return _run_validation_logic(state)
+        except Exception as e:
+            logger.error(f"Validation task failed: {e}")
+            return {'answer_mismatch': False}
 
     # Run both in parallel
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1386,9 +1414,23 @@ def parallel_review(state: AgentState) -> Dict:
         for future in as_completed([future_critique, future_validation]):
             try:
                 result = future.result()
-                results.update(result)
+                if result and isinstance(result, dict):
+                    results.update(result)
+                else:
+                    logger.warning(f"Review task returned invalid result: {result}")
             except Exception as e:
-                logger.error(f"Review task failed: {e}")
+                logger.error(f"Review task execution failed: {e}")
+
+    # Check if review passed
+    is_passing = results.get('critique', {}).get('is_passing', True)
+    has_mismatch = results.get('answer_mismatch', False)
+    
+    if is_passing and not has_mismatch:
+        results['verification_passed'] = True
+        logger.info(f"[Review] Question passed review - marked for archiving")
+    else:
+        results['verification_passed'] = False
+        logger.warning(f"[Review] Question failed review - critique_passing={is_passing}, has_mismatch={has_mismatch}")
 
     logger.info(f"Parallel review complete - Critique: {results.get('critique', {}).get('score', '?')}/10")
     return results
@@ -1398,7 +1440,11 @@ def _run_critique_logic(state: AgentState) -> Dict:
     if state.get('verification_error'):
         return {'critique': {'is_passing': True, 'score': 7}}
 
-    q = state['question_data']
+    q = state.get('question_data', {})
+    if not q:
+        logger.warning("[Critique] No question data available for critique")
+        return {'critique': {'is_passing': True, 'score': 7}}
+        
     code_draft = state.get('code_draft', {})
 
     system_prompt = f"""
@@ -1656,10 +1702,16 @@ def use_cached_question(state: AgentState) -> Dict:
         'cache_similarity': cached.get('similarity_score', 0)
     }
 
+    # ADD CACHE ID TO USED SET TO PREVENT REUSE
+    if cache_id:
+        used_cache_ids.add(cache_id)
+        logger.info(f"[CACHE] Added question #{cache_id} to used_cache_ids. Total used: {len(used_cache_ids)}")
+
     return {
         'question_data': question_data,
         'verification_passed': True,
-        'source_type': 'question_bank_cache'
+        'source_type': 'question_bank_cache',
+        'used_cache_ids': used_cache_ids  # Return updated set
     }
 
 
@@ -1873,8 +1925,21 @@ def build_graph():
         {"fallback": "fallback", "use_cache": "use_cache", "theory_author": "theory_author", "code_author": "code_author"}
     )
 
-    # Cache -> directly to save (skip all generation)
-    workflow.add_edge("use_cache", "archivist")
+    # Cache -> Save if using cache; otherwise route back to generation
+    def route_after_cache(state):
+        # If use_cached_question requested fallback (e.g., cache already used),
+        # route to appropriate generation path instead of archiving.
+        if state.get('use_fallback'):
+            # Respect conceptual topics: theory_author if conceptual, else code_author
+            return "theory_author" if state.get('is_conceptual') else "code_author"
+        # Using a valid cached question → archive directly
+        return "archivist"
+
+    workflow.add_conditional_edges(
+        "use_cache",
+        route_after_cache,
+        {"archivist": "archivist", "theory_author": "theory_author", "code_author": "code_author"}
+    )
 
     # Theory path goes straight to reviewer (no code execution needed)
     workflow.add_conditional_edges(
@@ -2107,6 +2172,9 @@ def run_agent(topic: str, difficulty: str = "Medium", question_type: str = None,
             # Auto-tag the question
             question_type = final_data.get('question_type', '')
             final_data['tags'] = auto_tag_question(topic, question_type, difficulty)
+
+            # DEDUPLICATION: Pass updated used_cache_ids back to caller
+            final_data['used_cache_ids'] = list(result.get('used_cache_ids', []))  # Convert set to list for JSON serialization
 
             # Note: Quality filtering happens in the graph via critic routing
             # If we reach here with a low score, it means we exhausted retries

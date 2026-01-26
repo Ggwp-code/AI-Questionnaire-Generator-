@@ -419,7 +419,9 @@ export const exportPaper = async (
       if (pdfSettings.department) params.append('department', pdfSettings.department);
     }
 
-    const response = await fetch(`${API_BASE}/paper/${paperId}/export?${params}`);
+    const response = await fetch(`${API_BASE}/paper/${paperId}/export?${params}`, {
+      headers: format === 'pdf' ? { 'Accept': 'application/pdf' } : { 'Accept': 'application/json' }
+    });
 
     if (!response.ok) {
       throw new Error(`Export failed: ${response.status}`);

@@ -721,12 +721,30 @@ const PaperGeneratorModule: React.FC<PaperGeneratorModuleProps> = ({ onNavigateT
     try {
       const result = await exportPaper(selectedPaper.paper_id, 'pdf', exportWithAnswers, pdfSettings);
       const blob = result as Blob;
+
+      // Validate blob
+      if (!blob || blob.size === 0) {
+        throw new Error('Empty PDF received from server');
+      }
+      if (blob.type && blob.type !== 'application/pdf') {
+        // Try to read error text for better diagnostics
+        const text = await blob.text().catch(() => '');
+        throw new Error(text || `Unexpected response type: ${blob.type}`);
+      }
+
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${selectedPaper.title.replace(/\s+/g, '_')}_${exportWithAnswers ? 'with_answers' : 'questions_only'}.pdf`;
+      const safeTitle = (selectedPaper.title || 'paper').replace(/\s+/g, '_');
+      a.download = `${safeTitle}_${exportWithAnswers ? 'with_answers' : 'questions_only'}.pdf`;
+      a.style.display = 'none';
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      // Give the browser a moment to start the download before revoking
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+      }, 1000);
       setShowExportModal(false);
     } catch (err: any) {
       setError(`Export failed: ${err.message}`);
