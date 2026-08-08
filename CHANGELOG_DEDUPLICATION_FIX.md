@@ -236,6 +236,6 @@ class AgentState(TypedDict):
 
 ---
 
-**Author**: Claude (Anthropic AI)
+**Author**: Ggwp-code
 **Reviewed**: Pending
 **Status**: Ready for testing

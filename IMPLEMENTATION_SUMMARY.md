@@ -4,7 +4,7 @@
 This document summarizes the implementation of Step 2 (Bloom-Adaptive RAG) and Step 3 (Pedagogy Tagger) for the AI Questionnaire Generator system.
 
 **Date:** 2026-01-17
-**Developer:** Claude (Anthropic)
+**Developer:** Ggwp-code
 **Status:** ✅ COMPLETE
 
 ---

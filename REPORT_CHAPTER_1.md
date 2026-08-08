@@ -25,6 +25,7 @@ Table 6.2: Bloom-Adaptive RAG Performance Comparison
 Table 6.3: Question Quality Metrics by Difficulty Level
 Table 6.4: CO/PO Mapping Accuracy
 Table 6.5: System Performance Benchmarks
+Table 6.6: Comparative Analysis of Retrieval Strategies
 
 ---
 
@@ -316,4 +317,3 @@ Empirical evaluation involved:
 - **Development**: Git for version control, pytest for testing
 
 This methodology enabled systematic development with continuous validation, ensuring each component met functional requirements before integration.
-
