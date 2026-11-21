@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 from sqlalchemy import select
 
@@ -12,7 +13,7 @@ from tribunal.context import AppContext
 from tribunal.db.models import Document, Paper, Slot
 from tribunal.generation.papers import regenerate, run_paper
 from tribunal.ingestion.pipeline import ingest_document
-from tribunal.jobs.queue import ClaimedJob, claim_next, fail_job, finish_job
+from tribunal.jobs.queue import ClaimedJob, claim_next, fail_job, finish_job, renew_lease
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +70,28 @@ FINAL_FAILURE: dict[str, Callable[[AppContext, ClaimedJob, str], None]] = {
 }
 
 
+@contextmanager
+def _lease_kept(ctx: AppContext, job: ClaimedJob, lease_seconds: float) -> Iterator[None]:
+    """Renew the job's lease every third of its length until the block ends."""
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(lease_seconds / 3):
+            try:
+                if not renew_lease(ctx.session_factory, job.id, job.attempts, lease_seconds):
+                    return  # another worker owns the job now
+            except Exception:
+                log.exception("could not renew the lease of job %s", job.id)
+
+    thread = threading.Thread(target=beat, name=f"lease-{job.id}", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+
+
 def run_once(ctx: AppContext) -> bool:
     retries = ctx.snapshot.config.retries
     job = claim_next(ctx.session_factory, retries.lease_seconds)
@@ -81,16 +104,20 @@ def run_once(ctx: AppContext) -> bool:
         handler = HANDLERS.get(job.kind)
         if handler is None:
             raise _Abandoned(f"unknown job kind '{job.kind}'")
-        handler(ctx, job)
+        with _lease_kept(ctx, job, retries.lease_seconds):
+            handler(ctx, job)
     except Exception as exc:
         log.exception("job %s (%s) failed", job.id, job.kind)
         max_attempts = 0 if isinstance(exc, _Abandoned) else retries.max_attempts
-        if not fail_job(ctx.session_factory, job.id, str(exc), max_attempts):
-            hook = FINAL_FAILURE.get(job.kind)
-            if hook:
-                hook(ctx, job, str(exc))
+        requeued = fail_job(ctx.session_factory, job.id, job.attempts, str(exc), max_attempts)
+        if requeued is False and (hook := FINAL_FAILURE.get(job.kind)):
+            hook(ctx, job, str(exc))
+        owned = requeued is not None
     else:
-        finish_job(ctx.session_factory, job.id)
+        owned = finish_job(ctx.session_factory, job.id, job.attempts)
+    if not owned:
+        log.warning("job %s (%s) was reclaimed by another worker after its lease expired; result discarded",
+                    job.id, job.kind)
     return True
 
 

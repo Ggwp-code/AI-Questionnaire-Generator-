@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from tribunal.db.models import Job
@@ -46,21 +46,29 @@ def claim_next(factory: sessionmaker[Session], lease_seconds: int, now: datetime
         return ClaimedJob(job.id, job.kind, job.target_id, job.config_snapshot_id, job.attempts)
 
 
-def finish_job(factory: sessionmaker[Session], job_id: str) -> None:
-    with factory.begin() as session:
-        job = session.get(Job, job_id)
-        job.status = "done"
-        job.finished_at = utcnow()
+def _owned(job_id: str, attempts: int):
+    """`attempts` grows on every claim, so it fences out a worker whose lease was taken over."""
+    return update(Job).where(Job.id == job_id, Job.status == "running", Job.attempts == attempts)
 
 
-def fail_job(factory: sessionmaker[Session], job_id: str, error: str, max_attempts: int) -> bool:
+def finish_job(factory: sessionmaker[Session], job_id: str, attempts: int) -> bool:
+    """Mark the job done. False when the caller no longer owns it."""
     with factory.begin() as session:
-        job = session.get(Job, job_id)
-        job.error = error
-        if job.attempts < max_attempts:
-            job.status = "queued"
-            job.lease_until = None
-            return True
-        job.status = "failed"
-        job.finished_at = utcnow()
-        return False
+        return session.execute(_owned(job_id, attempts).values(status="done", finished_at=utcnow())).rowcount == 1
+
+
+def fail_job(factory: sessionmaker[Session], job_id: str, attempts: int, error: str,
+             max_attempts: int) -> bool | None:
+    """True: queued for another attempt. False: failed for good. None: the caller no longer owns it."""
+    retry = attempts < max_attempts
+    values = {"status": "queued", "lease_until": None} if retry else {"status": "failed", "finished_at": utcnow()}
+    with factory.begin() as session:
+        owned = session.execute(_owned(job_id, attempts).values(error=error, **values)).rowcount == 1
+    return retry if owned else None
+
+
+def renew_lease(factory: sessionmaker[Session], job_id: str, attempts: int, lease_seconds: float) -> bool:
+    """Extend the lease of a running job. False when the caller no longer owns it."""
+    with factory.begin() as session:
+        until = utcnow() + timedelta(seconds=lease_seconds)
+        return session.execute(_owned(job_id, attempts).values(lease_until=until)).rowcount == 1

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import timedelta
 
+import pytest
 from conftest import make_subject, make_user
 
 from tribunal.db.models import Document, Job
 from tribunal.db.types import utcnow
 from tribunal.jobs import worker
-from tribunal.jobs.queue import claim_next, enqueue, fail_job
+from tribunal.jobs.queue import claim_next, enqueue, fail_job, finish_job, renew_lease
+from tribunal.runtime_config import ConfigSnapshot
 
 
 def _enqueue(ctx, *targets):
@@ -32,10 +35,10 @@ def test_expired_lease_reclaimed(ctx):
 
 def test_fail_requeues_then_fails(ctx):
     (a,) = _enqueue(ctx, "a")
-    claim_next(ctx.session_factory, 60)
-    assert fail_job(ctx.session_factory, a, "boom", 2) is True
-    claim_next(ctx.session_factory, 60)
-    assert fail_job(ctx.session_factory, a, "boom again", 2) is False
+    first = claim_next(ctx.session_factory, 60)
+    assert fail_job(ctx.session_factory, a, first.attempts, "boom", 2) is True
+    second = claim_next(ctx.session_factory, 60)
+    assert fail_job(ctx.session_factory, a, second.attempts, "boom again", 2) is False
     with ctx.session_factory() as s:
         job = s.get(Job, a)
         assert job.status == "failed" and job.error == "boom again"
@@ -118,3 +121,56 @@ def test_job_abandoned_after_repeated_lease_expiry(ctx, monkeypatch):
     with ctx.session_factory() as s:
         d = s.get(Document, doc_id)
         assert d.status == "failed" and d.error == expected
+
+
+def test_reclaimed_job_is_fenced_from_its_old_worker(ctx):
+    (a,) = _enqueue(ctx, "a")
+    first = claim_next(ctx.session_factory, 60)
+    second = claim_next(ctx.session_factory, 60, now=utcnow() + timedelta(seconds=61))
+    assert (first.attempts, second.attempts) == (1, 2)
+    assert finish_job(ctx.session_factory, a, first.attempts) is False
+    assert fail_job(ctx.session_factory, a, first.attempts, "late", 3) is None
+    assert renew_lease(ctx.session_factory, a, first.attempts, 60) is False
+    assert _job_status(ctx, a) == ("running", None)
+    assert finish_job(ctx.session_factory, a, second.attempts) is True
+    assert _job_status(ctx, a) == ("done", None)
+
+
+@pytest.mark.parametrize("outcome", ["returns", "raises"])
+def test_worker_that_lost_its_lease_leaves_job_alone(ctx, monkeypatch, caplog, outcome):
+    (a,) = _enqueue(ctx, "a")
+    later = utcnow() + timedelta(seconds=ctx.snapshot.config.retries.lease_seconds + 1)
+    taken, hooks = [], []
+
+    def slow(_ctx, _job):  # another worker reclaims the job while this one is still busy
+        taken.append(claim_next(ctx.session_factory, 60, now=later))
+        if outcome == "raises":
+            raise RuntimeError("late failure")
+
+    monkeypatch.setitem(worker.HANDLERS, "ingest", slow)
+    monkeypatch.setitem(worker.FINAL_FAILURE, "ingest", lambda *args: hooks.append(args))
+    assert worker.run_once(ctx) is True
+    assert taken[0].attempts == 2 and hooks == []
+    assert _job_status(ctx, a) == ("running", None)
+    assert f"job {a} (ingest) was reclaimed by another worker" in caplog.text
+
+
+def test_heartbeat_keeps_long_job_leased(ctx, monkeypatch):
+    lease = 0.5
+    cfg = ctx.snapshot.config
+    # built without validation, which would refuse a lease this short
+    ctx.snapshot = ConfigSnapshot.model_construct(config=cfg.model_copy(update={
+        "retries": cfg.retries.model_copy(update={"lease_seconds": lease})}), content_hash="short-lease")
+    (a,) = _enqueue(ctx, "a")
+    stolen = []
+
+    def long_job(_ctx, _job):
+        end = time.monotonic() + 3 * lease
+        while time.monotonic() < end:
+            stolen.append(claim_next(ctx.session_factory, lease))
+            time.sleep(lease / 5)
+
+    monkeypatch.setitem(worker.HANDLERS, "ingest", long_job)
+    assert worker.run_once(ctx) is True
+    assert stolen and not any(stolen)
+    assert _job_status(ctx, a) == ("done", None)
