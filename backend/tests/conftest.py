@@ -45,3 +45,37 @@ def cfg(snapshot) -> RuntimeConfig:
 @pytest.fixture
 def policy(cfg) -> TextPolicy:
     return TextPolicy(cfg.text_policy.preserve_codepoints)
+
+
+@pytest.fixture
+def fake_ocr():
+    from pdf_fixtures import FakeOcrEngine
+
+    return FakeOcrEngine({})
+
+
+@pytest.fixture
+def ctx(settings, fake_ocr):
+    from tribunal.context import build_context
+
+    return build_context(settings, ocr_override=fake_ocr, migrate=True)
+
+
+def make_user(session, email):
+    from tribunal.db.models import User
+
+    user = User(email=email.lower())
+    session.add(user)
+    session.flush()
+    return user
+
+
+def make_subject(session, owner, name):
+    from tribunal.db.models import Subject, SubjectMember
+
+    subject = Subject(name=name, owner_id=owner.id)
+    session.add(subject)
+    session.flush()
+    session.add(SubjectMember(subject_id=subject.id, user_id=owner.id, role="owner"))
+    session.flush()
+    return subject
