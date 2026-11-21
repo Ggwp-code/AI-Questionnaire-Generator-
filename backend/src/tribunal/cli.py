@@ -28,6 +28,14 @@ def _check_config() -> int:
     return 0
 
 
+def _db_upgrade() -> int:
+    from tribunal.db.migrate import upgrade
+
+    upgrade(load_settings().database_url)
+    print("database at head")
+    return 0
+
+
 def _files(paths: list[str], errors: list[str]):
     for raw in paths:
         root = Path(raw)
@@ -66,12 +74,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tribunal")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check-config", help="validate settings and runtime configuration")
+    sub.add_parser("db-upgrade", help="apply database migrations")
     scan = sub.add_parser("scan-text", help="report emoji in text files")
     scan.add_argument("--config", required=True)
     scan.add_argument("paths", nargs="+")
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
+    if args.command == "db-upgrade":
+        return _db_upgrade()
     return _scan_text(args.config, args.paths)
 
 
