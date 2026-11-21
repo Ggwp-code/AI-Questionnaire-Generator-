@@ -11,12 +11,13 @@ from tribunal.context import AppContext
 from tribunal.db.models import Paper, Slot
 from tribunal.db.types import utcnow
 from tribunal.generation.slots import _finish, generate_slot
+from tribunal.jobs.queue import ClaimedJob, OwnershipLost, owned_transaction
 from tribunal.runtime_config import ConfigSnapshot
 
 
-def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str) -> None:
+def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str, *, owner: ClaimedJob | None = None) -> None:
     deadline = utcnow() + timedelta(seconds=snapshot.config.budgets.paper_deadline_seconds)
-    with ctx.session_factory.begin() as s:
+    with owned_transaction(ctx.session_factory, owner) as s:
         # running slots are orphans of an earlier attempt of this job
         for orphan in s.scalars(select(Slot).where(Slot.paper_id == paper_id, Slot.status == "running")):
             orphan.status = "pending"
@@ -33,20 +34,22 @@ def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str) -> None:
 
     def one(slot_id: str) -> None:
         try:
-            generate_slot(ctx, snapshot, slot_id, deadline=deadline)
+            generate_slot(ctx, snapshot, slot_id, deadline=deadline, owner=owner)
+        except OwnershipLost:
+            raise
         except Exception as exc:
-            _finish(ctx, slot_id, "failed", f"{type(exc).__name__}: {exc}")
+            _finish(ctx, slot_id, "failed", f"{type(exc).__name__}: {exc}", owner)
 
     workers = max(1, min(snapshot.config.concurrency.per_paper, len(slot_ids)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(one, slot_ids))
-    with ctx.session_factory.begin() as s:
+    with owned_transaction(ctx.session_factory, owner) as s:
         paper = s.get(Paper, paper_id)
         paper.status, paper.completed_at = "drafted", utcnow()
 
 
-def regenerate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str) -> None:
-    with ctx.session_factory.begin() as s:
+def regenerate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str, *, owner: ClaimedJob | None = None) -> None:
+    with owned_transaction(ctx.session_factory, owner) as s:
         slot = s.get(Slot, slot_id)
         slot.status, slot.status_detail = "pending", None
-    generate_slot(ctx, snapshot, slot_id)
+    generate_slot(ctx, snapshot, slot_id, owner=owner)

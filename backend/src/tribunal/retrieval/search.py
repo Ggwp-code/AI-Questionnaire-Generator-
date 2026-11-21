@@ -31,11 +31,20 @@ class RetrievalResult:
 
 def retrieve(session: Session, embedder: Embedder, cfg: RetrievalConfig, *, subject_id: str,
              document_ids: list[str], query: str, topic: Topic | None = None) -> RetrievalResult:
-    rows = session.execute(
+    rows = searchable_passages(session, subject_id, document_ids)
+    return rank_passages(rows, embedder, cfg, query, topic)
+
+
+def searchable_passages(session: Session, subject_id: str, document_ids: list[str]):
+    return session.execute(
         select(Passage).join(Document, Document.id == Passage.document_id)
         .where(Passage.subject_id == subject_id, Passage.document_id.in_(document_ids),
                Document.status == "ready", Passage.extraction_version == Document.extraction_version)
     ).scalars().all()
+
+
+def rank_passages(rows, embedder: Embedder, cfg: RetrievalConfig, query: str,
+                  topic: Topic | None) -> RetrievalResult:
     version = "r-" + canonical_hash({
         "retrieval": cfg.model_dump(mode="json"),
         "extractions": sorted({p.extraction_version for p in rows}),

@@ -209,3 +209,39 @@ def test_over_page_limit_fails(ctx):
 def test_zero_page_pdf_fails(ctx):
     doc = _run(ctx, _doc(ctx, zero_page_pdf()))
     assert doc.status == "failed" and doc.error == "file is not a readable PDF"
+
+
+def test_failed_refresh_keeps_index_searchable_and_reports_error(ctx, monkeypatch):
+    from tribunal.db.models import Job
+    from tribunal.errors import ValidationFailed
+    from tribunal.jobs.queue import enqueue
+    from tribunal.jobs.worker import run_once
+
+    doc_id = _doc(ctx, digital_pdf(["Decision trees split data. " * 20]))
+    original = _run(ctx, doc_id)
+    snap = _rechunked(ctx)
+    pages, passages = _ids(ctx, Page), _ids(ctx, Passage)
+    with ctx.session_factory.begin() as s:
+        job_id = enqueue(s, "ingest", doc_id, snap.snapshot_id).id
+    monkeypatch.setattr(type(ctx), "snapshot_for", lambda self, sid: snap)
+
+    def check_search():
+        with ctx.session_factory() as s:
+            doc = s.get(Document, doc_id)
+            assert (doc.status, doc.extraction_version) == ("ready", original.extraction_version)
+            found = retrieve(s, ctx.embedder(snap), snap.config.retrieval, subject_id=doc.subject_id,
+                             document_ids=[doc_id], query="decision trees")
+            assert found.gap is None and {p.passage_id for p in found.passages} <= passages
+
+    def bad_read(*_args):
+        check_search()
+        raise ValidationFailed("refresh failed")
+
+    monkeypatch.setattr("tribunal.ingestion.pipeline.read_pdf", bad_read)
+    assert run_once(ctx)
+    check_search()
+    assert (_ids(ctx, Page), _ids(ctx, Passage)) == (pages, passages)
+    with ctx.session_factory() as s:
+        assert s.get(Document, doc_id).error == "refresh failed"
+        job = s.get(Job, job_id)
+        assert (job.status, job.error, job.attempts) == ("failed", "refresh failed", 1)

@@ -13,6 +13,7 @@ from tribunal.errors import TribunalError, ValidationFailed
 from tribunal.ingestion.chunking import chunk_pages
 from tribunal.ingestion.outline import build_outline
 from tribunal.ingestion.pdf import read_pdf, read_toc
+from tribunal.jobs.queue import ClaimedJob, owned_transaction
 from tribunal.runtime_config import ConfigSnapshot, RuntimeConfig, canonical_hash
 
 
@@ -31,31 +32,36 @@ def extraction_version(cfg: RuntimeConfig, languages: list[str], embedder_id: st
 def _fail(ctx: AppContext, document_id: str, error: str) -> None:
     with ctx.session_factory.begin() as session:
         doc = session.get(Document, document_id)
-        doc.status = "failed"
+        doc.status = "ready" if doc.extraction_version else "failed"
         doc.error = error
 
 
-def ingest_document(ctx: AppContext, snapshot: ConfigSnapshot, document_id: str) -> None:
+def ingest_document(ctx: AppContext, snapshot: ConfigSnapshot, document_id: str, *,
+                    owner: ClaimedJob | None = None) -> None:
     with ctx.session_factory() as session:
         doc = session.get(Document, document_id)
         storage_key, languages, subject_id = doc.storage_key, list(doc.ocr_languages), doc.subject_id
-        ready_version = doc.extraction_version if doc.status == "ready" else None
     try:
         xv = extraction_version(snapshot.config, languages, ctx.embedder(snapshot).model_id)
-        if xv == ready_version:
-            return  # this index version is already built; cited passages stay as they are
-        with ctx.session_factory.begin() as session:
+        with owned_transaction(ctx.session_factory, owner) as session:
             doc = session.get(Document, document_id)
-            doc.status, doc.error = "processing", None
-        _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv)
+            doc.error = None
+            doc.status = "ready" if doc.extraction_version else "processing"
+            if xv == doc.extraction_version:
+                return
+        _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, owner)
     except TribunalError as exc:
+        if owner is not None:
+            raise
         _fail(ctx, document_id, exc.message)
     except Exception as exc:
+        if owner is not None:
+            raise
         _fail(ctx, document_id, f"unexpected error: {exc}")
         raise
 
 
-def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv) -> None:
+def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, owner) -> None:
     cfg = snapshot.config
     ing = cfg.ingestion
     data = ctx.store.get(storage_key)
@@ -81,7 +87,7 @@ def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv) 
     vectors = embedder.embed([c.text for c in chunks]) if chunks else []
     outline = build_outline(read_toc(data), texts, ing.outline, len(infos))
 
-    with ctx.session_factory.begin() as session:
+    with owned_transaction(ctx.session_factory, owner) as session:
         # Passages and topics are never deleted: citations and slots reference them.
         session.execute(delete(Page).where(Page.document_id == document_id))
         for n in sorted(texts):

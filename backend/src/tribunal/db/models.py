@@ -192,6 +192,7 @@ class Job(Base):
     config_snapshot_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(20), default="queued")
     attempts: Mapped[int] = mapped_column(default=0)
+    reserved_tokens: Mapped[int] = mapped_column(default=0, server_default='0')
     lease_until: Mapped[datetime | None] = _opt_time()
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = _created()

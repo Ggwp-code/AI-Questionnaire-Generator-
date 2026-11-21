@@ -8,58 +8,56 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from tribunal.context import AppContext
 from tribunal.db.models import Document, Paper, Slot
+from tribunal.errors import TribunalError
 from tribunal.generation.papers import regenerate, run_paper
 from tribunal.ingestion.pipeline import ingest_document
-from tribunal.jobs.queue import ClaimedJob, claim_next, fail_job, finish_job, renew_lease
+from tribunal.jobs.queue import ClaimedJob, OwnershipLost, claim_next, fail_job, finish_job, renew_lease
 
 log = logging.getLogger(__name__)
 
 
 def _ingest(ctx: AppContext, job: ClaimedJob) -> None:
-    ingest_document(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id)
-    with ctx.session_factory() as session:
-        doc = session.get(Document, job.target_id)
-        if doc.status == "failed":  # a domain failure (bad PDF, limits): retrying cannot help
-            raise _PermanentFailure(doc.error)
+    try:
+        ingest_document(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id, owner=job)
+    except TribunalError as exc:
+        raise _PermanentFailure(exc.message) from exc
 
 
-def _ingest_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
-    with ctx.session_factory.begin() as session:
-        doc = session.get(Document, job.target_id)
-        if doc is not None:
-            doc.status = "failed"
-            doc.error = error
+def _ingest_failed(session, job: ClaimedJob, error: str) -> None:
+    doc = session.get(Document, job.target_id)
+    if doc is not None:
+        doc.status = "ready" if doc.extraction_version else "failed"
+        doc.error = error
 
 
 def _generate_paper(ctx: AppContext, job: ClaimedJob) -> None:
-    run_paper(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id)
+    run_paper(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id, owner=job)
 
 
 def _regenerate_slot(ctx: AppContext, job: ClaimedJob) -> None:
-    regenerate(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id)
+    regenerate(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id, owner=job)
 
 
-def _paper_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
-    with ctx.session_factory.begin() as session:
-        paper = session.get(Paper, job.target_id)
-        if paper is not None:
-            paper.status = "failed"
-            paper.error = error
-        for slot in session.scalars(select(Slot).where(Slot.paper_id == job.target_id,
-                                                       Slot.status.in_(("pending", "running")))):
-            slot.status = "failed"
-            slot.status_detail = f"paper generation failed: {error}"
+def _paper_failed(session, job: ClaimedJob, error: str) -> None:
+    paper = session.get(Paper, job.target_id)
+    if paper is not None:
+        paper.status = "failed"
+        paper.error = error
+    for slot in session.scalars(select(Slot).where(Slot.paper_id == job.target_id,
+                                                   Slot.status.in_(("pending", "running")))):
+        slot.status = "failed"
+        slot.status_detail = f"paper generation failed: {error}"
 
 
-def _slot_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
-    with ctx.session_factory.begin() as session:
-        slot = session.get(Slot, job.target_id)
-        if slot is not None:
-            slot.status = "failed"
-            slot.status_detail = f"regeneration failed: {error}"
+def _slot_failed(session, job: ClaimedJob, error: str) -> None:
+    slot = session.get(Slot, job.target_id)
+    if slot is not None:
+        slot.status = "failed"
+        slot.status_detail = f"regeneration failed: {error}"
 
 
 HANDLERS: dict[str, Callable[[AppContext, ClaimedJob], None]] = {
@@ -67,7 +65,7 @@ HANDLERS: dict[str, Callable[[AppContext, ClaimedJob], None]] = {
     "generate_paper": _generate_paper,
     "regenerate_slot": _regenerate_slot,
 }
-FINAL_FAILURE: dict[str, Callable[[AppContext, ClaimedJob, str], None]] = {
+FINAL_FAILURE: dict[str, Callable[[Session, ClaimedJob, str], None]] = {
     "ingest": _ingest_failed,
     "generate_paper": _paper_failed,
     "regenerate_slot": _slot_failed,
@@ -111,12 +109,15 @@ def run_once(ctx: AppContext) -> bool:
             raise _PermanentFailure(f"unknown job kind '{job.kind}'")
         with _lease_kept(ctx, job, retries.lease_seconds):
             handler(ctx, job)
+    except OwnershipLost:
+        owned = False
     except Exception as exc:
         log.exception("job %s (%s) failed", job.id, job.kind)
         max_attempts = 0 if isinstance(exc, _PermanentFailure) else retries.max_attempts
-        requeued = fail_job(ctx.session_factory, job.id, job.attempts, str(exc), max_attempts)
-        if requeued is False and (hook := FINAL_FAILURE.get(job.kind)):
-            hook(ctx, job, str(exc))
+        hook = FINAL_FAILURE.get(job.kind)
+        error = str(exc)
+        requeued = fail_job(ctx.session_factory, job.id, job.attempts, error, max_attempts,
+                            lambda session: hook(session, job, error) if hook else None)
         owned = requeued is not None
     else:
         owned = finish_job(ctx.session_factory, job.id, job.attempts)

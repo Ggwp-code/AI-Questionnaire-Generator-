@@ -201,3 +201,20 @@ def test_pdf_with_font(cfg):
     if not font.exists():
         pytest.skip("font not installed")
     assert render(doc_with("\u2212\u03a3 log\u2082"), cfg, font).startswith(b"%PDF")
+
+
+def test_failed_refresh_preserves_approved_key(ex, monkeypatch):
+    ctx, pid, doc = ex
+    approve(ctx, pid)
+    expected = export(ctx, pid, "key")
+
+    def failed_refresh(*_args):
+        assert export(ctx, pid, "key")["sections"] == expected["sections"]
+        raise ValidationFailed("could not refresh index")
+
+    monkeypatch.setattr("tribunal.ingestion.pipeline.extraction_version", lambda *_args: "changed")
+    monkeypatch.setattr("tribunal.ingestion.pipeline.read_pdf", failed_refresh)
+    ingest_document(ctx, ctx.snapshot, doc)
+    key = export(ctx, pid, "key")
+    assert key["sections"] == expected["sections"]
+    assert key["approvals"] == expected["approvals"]

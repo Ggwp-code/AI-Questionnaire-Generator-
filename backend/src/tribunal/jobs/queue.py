@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from tribunal.db.models import Job
+from tribunal.db.models import Job, Paper, Slot
 from tribunal.db.types import utcnow
 
 
@@ -31,18 +33,16 @@ def enqueue(session: Session, kind: str, target_id: str, snapshot_id: str) -> Jo
 def claim_next(factory: sessionmaker[Session], lease_seconds: int, now: datetime | None = None) -> ClaimedJob | None:
     now = now or utcnow()
     with factory.begin() as session:
-        job = session.scalars(
-            select(Job)
-            .where(or_(Job.status == "queued", (Job.status == "running") & (Job.lease_until < now)))
-            .order_by(Job.created_at, Job.id)
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        ).first()
+        eligible = or_(Job.status == "queued", (Job.status == "running") & (Job.lease_until < now))
+        candidate = (select(Job.id).where(eligible).order_by(Job.created_at, Job.id)
+                     .limit(1).with_for_update(skip_locked=True).scalar_subquery())
+        job = session.scalar(update(Job).where(Job.id == candidate, eligible)
+                             .values(status="running", attempts=Job.attempts + 1,
+                                     lease_until=now + timedelta(seconds=lease_seconds))
+                             .returning(Job).execution_options(synchronize_session=False))
         if job is None:
             return None
-        job.status = "running"
-        job.attempts += 1
-        job.lease_until = now + timedelta(seconds=lease_seconds)
+        _release_reservations(session, job)
         return ClaimedJob(job.id, job.kind, job.target_id, job.config_snapshot_id, job.attempts)
 
 
@@ -51,19 +51,50 @@ def _owned(job_id: str, attempts: int):
     return update(Job).where(Job.id == job_id, Job.status == "running", Job.attempts == attempts)
 
 
+class OwnershipLost(Exception):
+    """A newer attempt has taken responsibility for the target."""
+
+
+@contextmanager
+def owned_transaction(factory, owner: ClaimedJob | None):
+    with factory.begin() as session:
+        if owner is not None:
+            locked = session.execute(_owned(owner.id, owner.attempts).values(attempts=Job.attempts))
+            if locked.rowcount != 1:
+                raise OwnershipLost(owner.id)
+        yield session
+
+
+def _release_reservations(session, job):
+    if job.reserved_tokens:
+        paper_id = (job.target_id if job.kind == "generate_paper"
+                    else session.get(Slot, job.target_id).paper_id)
+        session.execute(update(Paper).where(Paper.id == paper_id)
+                        .values(tokens_used=Paper.tokens_used - job.reserved_tokens))
+        job.reserved_tokens = 0
+
+
 def finish_job(factory: sessionmaker[Session], job_id: str, attempts: int) -> bool:
     """Mark the job done. False when the caller no longer owns it."""
     with factory.begin() as session:
-        return session.execute(_owned(job_id, attempts).values(status="done", finished_at=utcnow())).rowcount == 1
+        result = session.execute(_owned(job_id, attempts).values(status="done", error=None, finished_at=utcnow()))
+        if result.rowcount == 1:
+            _release_reservations(session, session.get(Job, job_id))
+            return True
+        return False
 
 
 def fail_job(factory: sessionmaker[Session], job_id: str, attempts: int, error: str,
-             max_attempts: int) -> bool | None:
+             max_attempts: int, on_terminal: Callable[[Session], None] | None = None) -> bool | None:
     """True: queued for another attempt. False: failed for good. None: the caller no longer owns it."""
     retry = attempts < max_attempts
     values = {"status": "queued", "lease_until": None} if retry else {"status": "failed", "finished_at": utcnow()}
     with factory.begin() as session:
         owned = session.execute(_owned(job_id, attempts).values(error=error, **values)).rowcount == 1
+        if owned:
+            _release_reservations(session, session.get(Job, job_id))
+            if not retry and on_terminal:
+                on_terminal(session)
     return retry if owned else None
 
 

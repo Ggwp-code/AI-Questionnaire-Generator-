@@ -189,3 +189,66 @@ def test_ingest_job_reports_document_outcome(ctx, readable):
         error = None if readable else "file is not a readable PDF"
         assert (job.status, job.error, job.attempts) == ("done" if readable else "failed", error, 1)
         assert (doc.status, doc.error) == ("ready" if readable else "failed", error)
+
+
+def test_simultaneous_claims(ctx):
+    from concurrent.futures import ThreadPoolExecutor
+
+    (job_id,) = _enqueue(ctx, "a")
+    ready = threading.Barrier(2)
+
+    def claim():
+        ready.wait(timeout=5)
+        return claim_next(ctx.session_factory, 60)
+
+    with ThreadPoolExecutor(2) as pool:
+        claims = [pool.submit(claim) for _ in range(2)]
+        results = [f.result() for f in claims]
+    assert [(j.id, j.attempts) for j in results if j] == [(job_id, 1)]
+
+
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_reclaimed_ocr_preserves_winning_index(ctx, fake_ocr, monkeypatch, late_failure):
+    from pdf_fixtures import scanned_pdf
+
+    from tribunal.db.models import Page, Passage
+
+    ctx.store.put("k", scanned_pdf(1))
+    doc_id = _doc(ctx)
+    (job_id,) = _enqueue(ctx, doc_id)
+    winning_text = "Decision trees classify samples. " * 8
+
+    def paused_ocr(*args):
+        with ctx.session_factory.begin() as s:
+            s.get(Job, job_id).lease_until = utcnow() - timedelta(seconds=1)
+        monkeypatch.setattr(fake_ocr, "ocr_pages", lambda *args: {1: winning_text})
+        assert worker.run_once(ctx)
+        if late_failure:
+            raise RuntimeError("late OCR error")
+        return {1: "stale OCR"}
+
+    monkeypatch.setattr(fake_ocr, "ocr_pages", paused_ocr)
+    assert worker.run_once(ctx)
+    with ctx.session_factory() as s:
+        doc = s.get(Document, doc_id)
+        assert (doc.status, doc.error) == ("ready", None)
+        assert s.query(Page).one().text == winning_text
+        assert s.query(Passage).one().text == winning_text
+    assert _job_status(ctx, job_id) == ("done", None)
+
+
+def test_terminal_job_and_target_failure_roll_back_together(ctx):
+    doc_id = _doc(ctx)
+    (job_id,) = _enqueue(ctx, doc_id)
+    job = claim_next(ctx.session_factory, 60)
+
+    def broken_hook(session):
+        session.get(Document, doc_id).error = "partial"
+        session.flush()
+        raise RuntimeError("interrupted")
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        fail_job(ctx.session_factory, job_id, job.attempts, "failure", 0, broken_hook)
+    assert _job_status(ctx, job_id) == ("running", None)
+    with ctx.session_factory() as s:
+        assert s.get(Document, doc_id).error is None

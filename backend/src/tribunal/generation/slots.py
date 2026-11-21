@@ -7,13 +7,14 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 
 from tribunal.context import AppContext
-from tribunal.db.models import Paper, Revision, Slot, Topic
+from tribunal.db.models import Job, Paper, Revision, Slot, Topic
 from tribunal.db.types import utcnow
 from tribunal.generation.calls import BudgetExhausted, call_with_retries, reserve_tokens, settle_tokens
 from tribunal.generation.draft import DraftInvalid, Review, check_draft, parse_draft, parse_review
 from tribunal.generation.prompts import draft_block, passages_block, render, slot_block
 from tribunal.generation.providers.base import ProviderError, ProviderResult
-from tribunal.retrieval.search import retrieve
+from tribunal.jobs.queue import ClaimedJob, owned_transaction
+from tribunal.retrieval.search import rank_passages, searchable_passages
 from tribunal.runtime_config import ConfigSnapshot
 
 
@@ -21,8 +22,8 @@ class _Stop(Exception):
     """End the slot as failed with this message."""
 
 
-def _finish(ctx: AppContext, slot_id: str, status: str, detail: str | None) -> None:
-    with ctx.session_factory.begin() as s:
+def _finish(ctx: AppContext, slot_id: str, status: str, detail: str | None, owner: ClaimedJob | None = None) -> None:
+    with owned_transaction(ctx.session_factory, owner) as s:
         slot = s.get(Slot, slot_id)
         slot.status, slot.status_detail = status, detail
         if status in ("drafted", "needs_review"):
@@ -32,50 +33,55 @@ def _finish(ctx: AppContext, slot_id: str, status: str, detail: str | None) -> N
 
 
 def generate_slot(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str, *,
-                  deadline: datetime | None = None) -> None:
+                  deadline: datetime | None = None, owner: ClaimedJob | None = None) -> None:
     """`deadline` belongs to the current generation run; by default it starts with this slot."""
     deadline = deadline or utcnow() + timedelta(seconds=snapshot.config.budgets.paper_deadline_seconds)
     try:
-        status, detail = _generate(ctx, snapshot, slot_id, deadline)
+        status, detail = _generate(ctx, snapshot, slot_id, deadline, owner)
     except (ProviderError, BudgetExhausted, _Stop) as exc:
         status, detail = "failed", str(exc)
-    _finish(ctx, slot_id, status, detail)
+    _finish(ctx, slot_id, status, detail, owner)
 
 
 def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
-              deadline: datetime) -> tuple[str, str | None]:
+              deadline: datetime, owner: ClaimedJob | None) -> tuple[str, str | None]:
     cfg = snapshot.config
     g, budgets = cfg.generation, cfg.budgets
     policy = ctx.policy(snapshot)
-    with ctx.session_factory.begin() as s:
+    with owned_transaction(ctx.session_factory, owner) as s:
         slot = s.get(Slot, slot_id)
         slot.status = "running"
         paper = s.get(Paper, slot.paper_id)
         topic = s.get(Topic, slot.topic_id) if slot.topic_id else None
         paper_id, subject_id, doc_ids = paper.id, paper.subject_id, list(paper.document_ids)
-        s.expunge_all()  # detached copies stay readable after the session closes
 
     def call(role_name: str, system: str, user: str) -> tuple[ProviderResult, str]:
         if utcnow() > deadline:
             raise _Stop("paper deadline exceeded")
         provider, role = ctx.provider(snapshot, role_name)
-        with ctx.session_factory.begin() as s:
+        with owned_transaction(ctx.session_factory, owner) as s:
             reserve_tokens(s, paper_id, budgets.reserve_per_call, budgets.paper_tokens)
+            if owner:
+                s.get(Job, owner.id).reserved_tokens += budgets.reserve_per_call
         try:
             res = call_with_retries(lambda: provider.complete(role, system, user), cfg.retries)
         except BaseException:
-            with ctx.session_factory.begin() as s:
+            with owned_transaction(ctx.session_factory, owner) as s:
                 settle_tokens(s, paper_id, -budgets.reserve_per_call)
+                if owner:
+                    s.get(Job, owner.id).reserved_tokens -= budgets.reserve_per_call
             raise
-        with ctx.session_factory.begin() as s:
+        with owned_transaction(ctx.session_factory, owner) as s:
             settle_tokens(s, paper_id, res.input_tokens + res.output_tokens - budgets.reserve_per_call)
+            if owner:
+                s.get(Job, owner.id).reserved_tokens -= budgets.reserve_per_call
         return res, role.model
 
     if utcnow() > deadline:
         raise _Stop("paper deadline exceeded")
     with ctx.session_factory() as s:
-        found = retrieve(s, ctx.embedder(snapshot), cfg.retrieval, subject_id=subject_id,
-                         document_ids=doc_ids, query=slot.topic_title, topic=topic)
+        rows = searchable_passages(s, subject_id, doc_ids)
+    found = rank_passages(rows, ctx.embedder(snapshot), cfg.retrieval, slot.topic_title, topic)
     if found.gap:
         return "evidence_gap", found.gap
 
@@ -107,7 +113,7 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
         except DraftInvalid as exc:
             problems = exc.problems
             continue
-        with ctx.session_factory.begin() as s:
+        with owned_transaction(ctx.session_factory, owner) as s:
             nxt = (s.scalar(select(func.max(Revision.number)).where(Revision.slot_id == slot_id)) or 0) + 1
             rev = Revision(slot_id=slot_id, number=nxt, author="model", content=draft.model_dump(), model=model,
                            prompt_version=f"{wt.id}@{wt.version}", retrieval_version=found.version,
@@ -124,7 +130,7 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
             return "drafted", None
 
         def save(review: Review, rmodel: str, rev_id: str = rev_id) -> None:
-            with ctx.session_factory.begin() as s:
+            with owned_transaction(ctx.session_factory, owner) as s:
                 s.get(Revision, rev_id).review = {"verdict": review.verdict, "reasons": review.reasons,
                                                   "model": rmodel}
 

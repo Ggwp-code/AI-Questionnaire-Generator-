@@ -9,7 +9,7 @@ from conftest import make_subject, make_user
 from pdf_fixtures import digital_pdf
 
 from tribunal.context import build_context
-from tribunal.db.models import Document, Paper, PaperTemplate, Passage, Revision, Slot, Topic
+from tribunal.db.models import Document, Job, Paper, PaperTemplate, Passage, Revision, Slot, Topic
 from tribunal.db.types import utcnow
 from tribunal.generation.blueprint import expand_blueprint, parse_template_spec
 from tribunal.generation.papers import regenerate, run_paper
@@ -295,8 +295,45 @@ def test_final_failure_fails_open_slots(gen):
     ctx, pid, _ = gen
     with ctx.session_factory.begin() as s:
         s.query(Slot).filter_by(paper_id=pid, number=1).one().status = "running"
-    FINAL_FAILURE["generate_paper"](ctx, ClaimedJob("j", "generate_paper", pid, ctx.snapshot.snapshot_id, 3), "boom")
+        FINAL_FAILURE["generate_paper"](s, ClaimedJob("j", "generate_paper", pid, ctx.snapshot.snapshot_id, 3), "boom")
     sl = slots(ctx, pid)
     assert {s.status for s in sl} == {"failed"} and all("boom" in s.status_detail for s in sl)
     with ctx.session_factory() as s:
         assert s.get(Paper, pid).status == "failed"
+
+
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_reclaimed_generation_preserves_winning_result(settings, fake_ocr, fake_holder, late_failure):
+    ctx = make_ctx(settings, fake_ocr, fake_holder)
+    pid, _ = make_paper(ctx, topics=("Decision trees",), n=1)
+    with ctx.session_factory.begin() as s:
+        jid = enqueue(s, "generate_paper", pid, ctx.snapshot.snapshot_id).id
+
+    def result():
+        with ctx.session_factory() as s:
+            slot = s.query(Slot).filter_by(paper_id=pid).one()
+            paper = s.get(Paper, pid)
+            job = s.get(Job, jid)
+            return (slot.status, paper.status, job.status, paper.tokens_used, job.reserved_tokens,
+                    slot.current_revision_id, paper.completed_at, s.query(Revision).count())
+
+    winner = []
+
+    def paused_writer(user):
+        with ctx.session_factory.begin() as s:
+            job = s.get(Job, jid)
+            assert job.reserved_tokens == ctx.snapshot.config.budgets.reserve_per_call
+            job.lease_until = utcnow() - timedelta(seconds=1)
+        fake_holder["fake"].writer = None
+        assert run_once(ctx)
+        winner.append(result())
+        if late_failure:
+            raise RuntimeError("stale provider failure")
+        return _good(user)
+
+    fake_holder["fake"].writer = paused_writer
+    assert run_once(ctx)
+    assert [result()] == winner
+    slot, paper, job, used, reserved, _, _, count = winner[0]
+    assert (slot, paper, job, reserved, count) == ("drafted", "drafted", "done", 0, 1)
+    assert 0 < used < ctx.snapshot.config.budgets.reserve_per_call
