@@ -34,7 +34,7 @@ def retrieve(session: Session, embedder: Embedder, cfg: RetrievalConfig, *, subj
     rows = session.execute(
         select(Passage).join(Document, Document.id == Passage.document_id)
         .where(Passage.subject_id == subject_id, Passage.document_id.in_(document_ids),
-               Document.status == "ready")
+               Document.status == "ready", Passage.extraction_version == Document.extraction_version)
     ).scalars().all()
     version = "r-" + canonical_hash({
         "retrieval": cfg.model_dump(mode="json"),

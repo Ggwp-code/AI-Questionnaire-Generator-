@@ -3,12 +3,13 @@ from __future__ import annotations
 import pytest
 from conftest import make_subject, make_user
 from pdf_fixtures import FakeOcrEngine, digital_pdf, encrypted_pdf, mixed_pdf, scanned_pdf, zero_page_pdf
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from tribunal.context import build_context
-from tribunal.db.models import Document, Page, Passage, Topic
+from tribunal.db.models import Document, Page, Paper, PaperTemplate, Passage, Slot, Topic
 from tribunal.ingestion.ocr import OcrUnavailable
 from tribunal.ingestion.pipeline import extraction_version, ingest_document
+from tribunal.retrieval.search import retrieve
 from tribunal.runtime_config import ConfigSnapshot
 from tribunal.settings import load_settings, reset_settings_cache
 
@@ -30,11 +31,6 @@ def _run(ctx, doc_id):
     ingest_document(ctx, ctx.snapshot, doc_id)
     with ctx.session_factory() as s:
         return s.get(Document, doc_id)
-
-
-def _count(ctx, model):
-    with ctx.session_factory() as s:
-        return s.scalar(select(func.count()).select_from(model))
 
 
 def test_digital_document_ready(ctx, fake_ocr):
@@ -104,12 +100,72 @@ def test_unexpected_error_fails_and_reraises(ctx):
         assert s.get(Document, doc_id).status == "failed"
 
 
-def test_reingest_replaces_rows(ctx):
+def _ids(ctx, model):
+    with ctx.session_factory() as s:
+        return set(s.scalars(select(model.id)))
+
+
+def test_reingest_same_version_is_noop(ctx):
     doc_id = _doc(ctx, digital_pdf(["Alpha beta gamma. " * 30, "Delta epsilon. " * 30], [("Intro", 1)]))
     _run(ctx, doc_id)
-    before = (_count(ctx, Page), _count(ctx, Passage), _count(ctx, Topic))
+    before = (_ids(ctx, Page), _ids(ctx, Passage), _ids(ctx, Topic))
+    assert _run(ctx, doc_id).status == "ready"
+    assert (_ids(ctx, Page), _ids(ctx, Passage), _ids(ctx, Topic)) == before
+
+
+def _rechunked(ctx) -> ConfigSnapshot:
+    cfg = ctx.snapshot.config
+    cfg = cfg.model_copy(update={"retrieval": cfg.retrieval.model_copy(update={"chunk_chars": 400})})
+    return ConfigSnapshot(config=cfg, content_hash="rechunked")
+
+
+def test_reingest_new_version_keeps_old_passages(ctx):
+    doc_id = _doc(ctx, digital_pdf(["Decision trees split data. " * 20, "Linear regression fits lines. " * 20]))
+    old_version = _run(ctx, doc_id).extraction_version
+    old = _ids(ctx, Passage)
+    snap = _rechunked(ctx)
+    ingest_document(ctx, snap, doc_id)
+    with ctx.session_factory() as s:
+        doc = s.get(Document, doc_id)
+        assert doc.status == "ready" and doc.extraction_version != old_version
+        assert all(s.get(Passage, pid) is not None for pid in old)
+        new = set(s.scalars(select(Passage.id).where(Passage.extraction_version == doc.extraction_version)))
+        found = retrieve(s, ctx.embedder(snap), snap.config.retrieval, subject_id=doc.subject_id,
+                         document_ids=[doc_id], query="decision trees")
+    assert new and not new & old
+    assert found.gap is None and {p.passage_id for p in found.passages} <= new
+
+
+def test_reingest_back_to_earlier_version_reuses_its_passages(ctx):
+    doc_id = _doc(ctx, digital_pdf(["Decision trees split data. " * 20]))
     _run(ctx, doc_id)
-    assert (_count(ctx, Page), _count(ctx, Passage), _count(ctx, Topic)) == before
+    first = _ids(ctx, Passage)
+    ingest_document(ctx, _rechunked(ctx), doc_id)
+    second = _ids(ctx, Passage) - first
+    _run(ctx, doc_id)
+    assert _ids(ctx, Passage) == first | second
+
+
+def test_reingest_keeps_outline_topic_used_by_slot(ctx):
+    doc_id = _doc(ctx, digital_pdf(["Decision trees split data. " * 20] * 2, [("Decision Trees", 1)]))
+    _run(ctx, doc_id)
+    with ctx.session_factory.begin() as s:
+        doc = s.get(Document, doc_id)
+        topic = s.scalars(select(Topic).where(Topic.document_id == doc_id)).one()
+        tpl = PaperTemplate(owner_id=doc.uploaded_by, name="t", version=1, spec={})
+        s.add(tpl)
+        s.flush()
+        paper = Paper(subject_id=doc.subject_id, created_by=doc.uploaded_by, template_id=tpl.id, title="P",
+                      config_snapshot_id=ctx.snapshot.snapshot_id, document_ids=[doc_id], topic_ids=[topic.id])
+        s.add(paper)
+        s.flush()
+        s.add(Slot(paper_id=paper.id, number=1, section="A", question_type="short_answer", marks=2,
+                   bloom="understand", difficulty="easy", topic_id=topic.id, topic_title=topic.title))
+        topic_id = topic.id
+    ingest_document(ctx, _rechunked(ctx), doc_id)
+    with ctx.session_factory() as s:
+        assert s.get(Document, doc_id).status == "ready"
+        assert [t.id for t in s.scalars(select(Topic).where(Topic.document_id == doc_id))] == [topic_id]
 
 
 def test_ocr_language_from_config(test_env, monkeypatch):

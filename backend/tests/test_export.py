@@ -139,6 +139,15 @@ def test_key_has_answers_and_citations(ex):
     assert all("answer" not in x for x in export(ctx, pid, "paper")["sections"][0]["questions"])
 
 
+def test_key_survives_reingest_of_same_pdf(ex):
+    ctx, pid, doc = ex
+    approve(ctx, pid)
+    cited = [c["passage_id"] for q in export(ctx, pid, "key")["sections"][0]["questions"] for c in q["citations"]]
+    ingest_document(ctx, ctx.snapshot, doc)
+    again = [c["passage_id"] for q in export(ctx, pid, "key")["sections"][0]["questions"] for c in q["citations"]]
+    assert cited and again == cited
+
+
 def test_duplicate_detected(ex):
     ctx, pid, _ = ex
     set_content(ctx, pid, 2, question="Explain how decision trees split data into branches.")

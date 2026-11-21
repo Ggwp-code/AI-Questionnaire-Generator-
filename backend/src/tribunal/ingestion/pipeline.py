@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib.metadata import version
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from tribunal.context import AppContext
 from tribunal.db.models import Document, Page, Passage, Topic
@@ -36,13 +36,18 @@ def _fail(ctx: AppContext, document_id: str, error: str) -> None:
 
 
 def ingest_document(ctx: AppContext, snapshot: ConfigSnapshot, document_id: str) -> None:
-    with ctx.session_factory.begin() as session:
+    with ctx.session_factory() as session:
         doc = session.get(Document, document_id)
-        doc.status = "processing"
-        doc.error = None
         storage_key, languages, subject_id = doc.storage_key, list(doc.ocr_languages), doc.subject_id
+        ready_version = doc.extraction_version if doc.status == "ready" else None
     try:
-        _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id)
+        xv = extraction_version(snapshot.config, languages, ctx.embedder(snapshot).model_id)
+        if xv == ready_version:
+            return  # this index version is already built; cited passages stay as they are
+        with ctx.session_factory.begin() as session:
+            doc = session.get(Document, document_id)
+            doc.status, doc.error = "processing", None
+        _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv)
     except TribunalError as exc:
         _fail(ctx, document_id, exc.message)
     except Exception as exc:
@@ -50,7 +55,7 @@ def ingest_document(ctx: AppContext, snapshot: ConfigSnapshot, document_id: str)
         raise
 
 
-def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id) -> None:
+def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv) -> None:
     cfg = snapshot.config
     ing = cfg.ingestion
     data = ctx.store.get(storage_key)
@@ -75,22 +80,32 @@ def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id) -> N
     chunks = chunk_pages(texts, cfg.retrieval.chunk_chars, cfg.retrieval.chunk_overlap_chars)
     vectors = embedder.embed([c.text for c in chunks]) if chunks else []
     outline = build_outline(read_toc(data), texts, ing.outline, len(infos))
-    xv = extraction_version(cfg, languages, embedder.model_id)
 
     with ctx.session_factory.begin() as session:
-        for model in (Page, Passage):
-            session.execute(delete(model).where(model.document_id == document_id))
-        session.execute(delete(Topic).where(Topic.document_id == document_id, Topic.source != "faculty"))
+        # Passages and topics are never deleted: citations and slots reference them.
+        session.execute(delete(Page).where(Page.document_id == document_id))
         for n in sorted(texts):
             session.add(Page(document_id=document_id, page_number=n, method=methods[n],
                              char_count=len(texts[n]), text=texts[n]))
-        for c, v in zip(chunks, vectors, strict=True):
-            session.add(Passage(document_id=document_id, subject_id=subject_id, page_number=c.page_number,
-                                char_start=c.char_start, char_end=c.char_end, text=c.text,
-                                embedding=v, extraction_version=xv))
+        built = session.scalar(select(Passage.id).where(Passage.document_id == document_id,
+                                                        Passage.extraction_version == xv).limit(1))
+        if built is None:  # otherwise an earlier run built this version: reuse it, never duplicate it
+            for c, v in zip(chunks, vectors, strict=True):
+                session.add(Passage(document_id=document_id, subject_id=subject_id, page_number=c.page_number,
+                                    char_start=c.char_start, char_end=c.char_end, text=c.text,
+                                    embedding=v, extraction_version=xv))
+        existing: dict[str, list[Topic]] = {}
+        for t in session.scalars(select(Topic).where(Topic.document_id == document_id, Topic.source != "faculty")
+                                 .order_by(Topic.page_start, Topic.created_at)):
+            existing.setdefault(t.title.lower(), []).append(t)
         for e in outline:
-            session.add(Topic(subject_id=subject_id, document_id=document_id, title=e.title,
-                              page_start=e.page_start, page_end=e.page_end, source=e.source))
+            same = existing.get(e.title.lower())
+            if same:
+                topic = same.pop(0)
+                topic.page_start, topic.page_end = e.page_start, e.page_end
+            else:
+                session.add(Topic(subject_id=subject_id, document_id=document_id, title=e.title,
+                                  page_start=e.page_start, page_end=e.page_end, source=e.source))
         doc = session.get(Document, document_id)
         doc.page_count, doc.extraction_version = len(infos), xv
         doc.status, doc.ready_at, doc.error = "ready", utcnow(), None
