@@ -7,7 +7,8 @@ import threading
 from collections.abc import Callable
 
 from tribunal.context import AppContext
-from tribunal.db.models import Document
+from tribunal.db.models import Document, Paper, Slot
+from tribunal.generation.papers import regenerate, run_paper
 from tribunal.ingestion.pipeline import ingest_document
 from tribunal.jobs.queue import ClaimedJob, claim_next, fail_job, finish_job
 
@@ -26,8 +27,40 @@ def _ingest_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
             doc.error = error
 
 
-HANDLERS: dict[str, Callable[[AppContext, ClaimedJob], None]] = {"ingest": _ingest}
-FINAL_FAILURE: dict[str, Callable[[AppContext, ClaimedJob, str], None]] = {"ingest": _ingest_failed}
+def _generate_paper(ctx: AppContext, job: ClaimedJob) -> None:
+    run_paper(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id)
+
+
+def _regenerate_slot(ctx: AppContext, job: ClaimedJob) -> None:
+    regenerate(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id)
+
+
+def _paper_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
+    with ctx.session_factory.begin() as session:
+        paper = session.get(Paper, job.target_id)
+        if paper is not None:
+            paper.status = "failed"
+            paper.error = error
+
+
+def _slot_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
+    with ctx.session_factory.begin() as session:
+        slot = session.get(Slot, job.target_id)
+        if slot is not None:
+            slot.status = "failed"
+            slot.status_detail = error
+
+
+HANDLERS: dict[str, Callable[[AppContext, ClaimedJob], None]] = {
+    "ingest": _ingest,
+    "generate_paper": _generate_paper,
+    "regenerate_slot": _regenerate_slot,
+}
+FINAL_FAILURE: dict[str, Callable[[AppContext, ClaimedJob, str], None]] = {
+    "ingest": _ingest_failed,
+    "generate_paper": _paper_failed,
+    "regenerate_slot": _slot_failed,
+}
 
 
 def run_once(ctx: AppContext) -> bool:
