@@ -36,18 +36,36 @@ def run_once(ctx: AppContext) -> bool:
     if job is None:
         return False
     try:
-        HANDLERS[job.kind](ctx, job)
+        if job.attempts > retries.max_attempts:
+            # Reclaimed after lease expiry too often: the worker likely dies on this job.
+            raise _Abandoned(f"job abandoned after {job.attempts - 1} attempts; the worker stopped while processing it")
+        handler = HANDLERS.get(job.kind)
+        if handler is None:
+            raise _Abandoned(f"unknown job kind '{job.kind}'")
+        handler(ctx, job)
     except Exception as exc:
         log.exception("job %s (%s) failed", job.id, job.kind)
-        if not fail_job(ctx.session_factory, job.id, str(exc), retries.max_attempts):
-            FINAL_FAILURE[job.kind](ctx, job, str(exc))
+        max_attempts = 0 if isinstance(exc, _Abandoned) else retries.max_attempts
+        if not fail_job(ctx.session_factory, job.id, str(exc), max_attempts):
+            hook = FINAL_FAILURE.get(job.kind)
+            if hook:
+                hook(ctx, job, str(exc))
     else:
         finish_job(ctx.session_factory, job.id)
     return True
 
 
+class _Abandoned(Exception):
+    """A job that must fail now, without further retries."""
+
+
 def run_forever(ctx: AppContext, stop: threading.Event | None = None) -> None:
     stop = stop or threading.Event()
     while not stop.is_set():
-        if not run_once(ctx):
+        try:
+            busy = run_once(ctx)
+        except Exception:
+            log.exception("worker iteration failed")
+            busy = False
+        if not busy:
             stop.wait(ctx.snapshot.config.retries.poll_interval_seconds)

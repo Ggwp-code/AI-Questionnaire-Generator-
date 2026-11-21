@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import pytest
 from conftest import make_subject, make_user
-from pdf_fixtures import FakeOcrEngine, digital_pdf, encrypted_pdf, mixed_pdf, scanned_pdf
+from pdf_fixtures import FakeOcrEngine, digital_pdf, encrypted_pdf, mixed_pdf, scanned_pdf, zero_page_pdf
 from sqlalchemy import func, select
 
 from tribunal.context import build_context
 from tribunal.db.models import Document, Page, Passage, Topic
 from tribunal.ingestion.ocr import OcrUnavailable
 from tribunal.ingestion.pipeline import extraction_version, ingest_document
+from tribunal.runtime_config import ConfigSnapshot
 from tribunal.settings import load_settings, reset_settings_cache
 
 
@@ -125,3 +126,30 @@ def test_ocr_language_from_config(test_env, monkeypatch):
 def test_extraction_version_changes_with_language(cfg):
     assert extraction_version(cfg, ["eng"], "e") != extraction_version(cfg, ["hin"], "e")
     assert extraction_version(cfg, ["eng"], "e") == extraction_version(cfg, ["eng"], "e")
+
+
+def _limited(ctx, **limits):
+    cfg = ctx.snapshot.config
+    cfg = cfg.model_copy(update={"ingestion": cfg.ingestion.model_copy(update=limits)})
+    return ConfigSnapshot(config=cfg, content_hash="x")
+
+
+def test_over_size_limit_fails(ctx):
+    doc_id = _doc(ctx, digital_pdf(["Alpha beta. " * 20]))
+    ingest_document(ctx, _limited(ctx, max_upload_bytes=10), doc_id)
+    with ctx.session_factory() as s:
+        d = s.get(Document, doc_id)
+    assert d.status == "failed" and d.error == "file is larger than the 10 byte limit"
+
+
+def test_over_page_limit_fails(ctx):
+    doc_id = _doc(ctx, digital_pdf(["Alpha beta. " * 20] * 3))
+    ingest_document(ctx, _limited(ctx, max_pages=2), doc_id)
+    with ctx.session_factory() as s:
+        d = s.get(Document, doc_id)
+    assert d.status == "failed" and d.error == "PDF has 3 pages; the limit is 2"
+
+
+def test_zero_page_pdf_fails(ctx):
+    doc = _run(ctx, _doc(ctx, zero_page_pdf()))
+    assert doc.status == "failed" and doc.error == "file is not a readable PDF"
