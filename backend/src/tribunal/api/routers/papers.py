@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -15,6 +17,7 @@ from tribunal.context import AppContext
 from tribunal.db.models import Document, Paper, PaperTemplate, Passage, Revision, Slot, Topic, User
 from tribunal.db.types import utcnow
 from tribunal.errors import Conflict, NotFound, ValidationFailed
+from tribunal.export.render import build_export, render_pdf
 from tribunal.generation.blueprint import expand_blueprint, parse_template_spec
 from tribunal.generation.draft import Draft, check_draft
 from tribunal.jobs.queue import enqueue
@@ -202,3 +205,17 @@ def approve(pid: str, n: int, user: User = Depends(current_user), session: Sessi
     rev.approved_by, rev.approved_at = user.id, utcnow()
     slot.status = "approved"
     return {"slot_id": slot.id, "number": slot.number, "status": slot.status, "revision": _rev_json(rev)}
+
+
+@router.get("/papers/{pid}/export")
+def export(pid: str, part: Literal["paper", "key"], format: Literal["json", "pdf"] = "json",
+           user: User = Depends(current_user), session: Session = Depends(get_session),
+           ctx: AppContext = Depends(get_ctx)):
+    paper = load_paper(session, user, pid)
+    snap = ctx.snapshot_for(paper.config_snapshot_id)
+    doc = build_export(session, paper, part, snap, ctx.policy(snap))
+    if format == "json":
+        return doc
+    st = ctx.settings
+    return Response(render_pdf(doc, font_regular=st.pdf_font_regular, font_bold=st.pdf_font_bold,
+                               fallbacks=st.pdf_font_fallbacks, cfg=snap.config.export), media_type="application/pdf")

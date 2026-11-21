@@ -172,15 +172,30 @@ def test_edit_and_approve(client, paper):
     assert client.put(url, json={"content": dict(content, answer="  ")}, headers=h(A)).status_code == 422
     r = client.put(url, json={"content": dict(content, answer="Edited answer")}, headers=h(A))
     assert r.status_code == 200 and r.json()["author"] == "faculty"
+    blocked = client.get(f"/api/papers/{paper}/export?part=key&format=json", headers=h(A))
+    assert blocked.status_code == 409 and blocked.json()["error"]["code"] == "export_blocked"
+    assert blocked.json()["error"]["details"]
+    # the stub writes near-identical questions, which export refuses, so give 2 and 3 distinct wording
+    for n, q in ((2, "Describe how pruning limits tree depth"), (3, "Explain least squares fitting of a regression line")):
+        c = dict(client.get(f"/api/papers/{paper}", headers=h(A)).json()["slots"][n - 1]["revision"]["content"], question=q)
+        assert client.put(f"/api/papers/{paper}/slots/{n}", json={"content": c}, headers=h(A)).status_code == 200
+    c = dict(content, answer="Edited answer", question="Why do decision trees overfit noisy training data")
+    assert client.put(url, json={"content": c}, headers=h(A)).status_code == 200
     for n in (1, 2, 3):
         assert client.post(f"/api/papers/{paper}/slots/{n}/approve", headers=h(A)).status_code == 200
     slots = client.get(f"/api/papers/{paper}", headers=h(A)).json()["slots"]
     assert [s["status"] for s in slots] == ["approved"] * 3
     assert client.post(f"/api/papers/{paper}/slots/1/approve", headers=h(A)).status_code == 409
+    key = client.get(f"/api/papers/{paper}/export?part=key&format=json", headers=h(A))
+    assert key.status_code == 200 and str(key.json()).count("Edited answer") >= 1
+    pdf = client.get(f"/api/papers/{paper}/export?part=paper&format=pdf", headers=h(A))
+    assert pdf.status_code == 200 and pdf.headers["content-type"] == "application/pdf" and pdf.content.startswith(b"%PDF")
+    assert client.get(f"/api/papers/{paper}/export?part=bad", headers=h(A)).status_code == 422
 
 
 def test_foreign_paper_hidden(client, paper):
     assert client.get(f"/api/papers/{paper}", headers=h(B)).status_code == 404
+    assert client.get(f"/api/papers/{paper}/export?part=key", headers=h(B)).status_code == 404
     assert client.put(f"/api/papers/{paper}/slots/1", json={"content": {}}, headers=h(B)).status_code == 404
     assert client.post(f"/api/papers/{paper}/slots/1/approve", headers=h(B)).status_code == 404
 
