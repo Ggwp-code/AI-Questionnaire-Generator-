@@ -36,9 +36,12 @@ def _db_upgrade() -> int:
     return 0
 
 
-def _files(paths: list[str]):
+def _files(paths: list[str], errors: list[str]):
     for raw in paths:
         root = Path(raw)
+        if not root.exists():
+            errors.append(f"{raw}: path does not exist")
+            continue
         candidates = [root] if root.is_file() else sorted(root.rglob("*"))
         for p in candidates:
             if p.is_file() and p.suffix in SCAN_SUFFIXES and not SKIP_DIRS.intersection(p.parts):
@@ -50,17 +53,21 @@ def _scan_text(config: str, paths: list[str]) -> int:
     raw = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
     policy = TextPolicy(raw["text_policy"]["preserve_codepoints"])
     found = 0
-    for path in _files(paths):
+    errors: list[str] = []
+    for path in _files(paths, errors):
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError) as exc:
-            print(f"{path}: not scanned ({exc})", file=sys.stderr)
+            errors.append(f"{path}: not scanned ({exc})")
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
             for finding in policy.findings(line):
                 found += 1
                 print(f"{path}:{lineno}:{finding.index + 1} {finding.codepoints}")
-    return 1 if found else 0
+    for message in errors:
+        print(message, file=sys.stderr)
+    # 0 clean, 1 findings, 2 a path missing or a file unreadable (a partial scan is never a pass)
+    return 2 if errors else (1 if found else 0)
 
 
 def main(argv: list[str] | None = None) -> int:

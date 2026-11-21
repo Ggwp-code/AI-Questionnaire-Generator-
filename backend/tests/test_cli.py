@@ -22,3 +22,15 @@ def test_scan_text(test_env, tmp_path, capsys):
     assert ":1:7 U+1F600" in capsys.readouterr().out
     f.write_text("hello", encoding="utf-8")
     assert main(args) == 0
+
+
+def test_scan_text_missing_path(test_env, tmp_path, capsys):
+    missing = tmp_path / "nope"
+    assert main(["scan-text", "--config", str(test_env["runtime"]), str(missing)]) == 2
+    assert "nope: path does not exist" in capsys.readouterr().err
+
+
+def test_scan_text_unreadable_file(test_env, tmp_path, capsys):
+    (tmp_path / "bad.txt").write_bytes(b"\xff\xfe\xfa")
+    assert main(["scan-text", "--config", str(test_env["runtime"]), str(tmp_path)]) == 2
+    assert "bad.txt: not scanned" in capsys.readouterr().err
