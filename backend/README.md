@@ -23,14 +23,16 @@ Required on every profile:
   DATABASE_URL         for example sqlite:///tribunal.db
   RUNTIME_CONFIG       path to the runtime configuration file
   AUTH_MODE            dev or oidc
-  STORAGE_BACKEND      local (s3 is not implemented yet)
+  STORAGE_BACKEND      local or s3; s3 is NOT implemented in this build
   SIGNING_SECRET       at least 32 characters
 
 Also required, by profile:
   STORAGE_LOCAL_ROOT   when STORAGE_BACKEND is local
   OIDC_ISSUER, OIDC_AUDIENCE, OIDC_JWKS_URL   when AUTH_MODE is oidc
   Hosted profiles (staging, production): AUTH_MODE oidc, ALLOWED_ORIGINS, an https PUBLIC_BASE_URL,
-  a PostgreSQL DATABASE_URL and PDF_FONT_REGULAR.
+  a PostgreSQL DATABASE_URL, PDF_FONT_REGULAR and STORAGE_BACKEND s3.
+  Because s3 is not implemented yet, staging and production cannot start in this build; only the
+  local and test profiles run.
 
 AUTH_MODE dev trusts an X-Dev-User header and is for local use and tests only.
 

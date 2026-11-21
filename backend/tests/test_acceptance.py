@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -209,6 +211,26 @@ def test_emoji_response_through_generation_and_export(test_env, settings, cfg, p
         assert needle in text
 
 
+class _CountingProvider:
+    """Stub provider that records the peak number of concurrent writer calls."""
+
+    def __init__(self, cfg, tally):
+        self._stub, self._tally = StubProvider(cfg), tally
+
+    def complete(self, role, system, user):
+        if role.prompt != "writer":
+            return self._stub.complete(role, system, user)
+        with self._tally["lock"]:
+            self._tally["now"] += 1
+            self._tally["max"] = max(self._tally["max"], self._tally["now"])
+        try:
+            time.sleep(0.05)
+            return self._stub.complete(role, system, user)
+        finally:
+            with self._tally["lock"]:
+                self._tally["now"] -= 1
+
+
 def _profile(tmp_path, monkeypatch, n, model, per_paper, lang, marks):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / f'p{n}.db'}")
     monkeypatch.setenv("STORAGE_LOCAL_ROOT", str(tmp_path / f"store{n}"))
@@ -217,17 +239,21 @@ def _profile(tmp_path, monkeypatch, n, model, per_paper, lang, marks):
     monkeypatch.setenv("TRIBUNAL_OCR_LANGUAGE", lang)
     reset_settings_cache()
     ocr = FakeOcrEngine(HISTORY_OCR)
-    ctx = build_context(load_settings(), ocr_override=ocr, migrate=True)
+    tally = {"lock": threading.Lock(), "now": 0, "max": 0}
+    ctx = build_context(load_settings(), ocr_override=ocr, migrate=True,
+                        provider_factory=lambda n, c: _CountingProvider(c, tally))
+    assert ctx.snapshot.config.concurrency.per_paper == per_paper
     client = TestClient(create_app(ctx))
     sid = new_subject(client, A, "Modern History")
     ingest(client, ctx, sid, A, scanned_pdf(2))
     pid = make_paper(client, ctx, sid, A, [t["id"] for t in topics(client, sid, A)], marks)
-    return ocr, get_paper(client, pid, A)
+    return ocr, get_paper(client, pid, A), tally["max"]
 
 
 def test_two_deployment_profiles(test_env, tmp_path, monkeypatch):
-    ocr1, p1 = _profile(tmp_path, monkeypatch, 1, "stub-writer-a", 1, "eng", 2)
-    ocr2, p2 = _profile(tmp_path, monkeypatch, 2, "stub-writer-b", 3, "hin", 5)
+    ocr1, p1, peak1 = _profile(tmp_path, monkeypatch, 1, "stub-writer-a", 1, "eng", 2)
+    ocr2, p2, _ = _profile(tmp_path, monkeypatch, 2, "stub-writer-b", 3, "hin", 5)
+    assert peak1 == 1
     assert {s["revision"]["model"] for s in p1["slots"]} == {"stub-writer-a"}
     assert {s["revision"]["model"] for s in p2["slots"]} == {"stub-writer-b"}
     assert {tuple(lang) for _, lang in ocr1.calls} == {("eng",)}
@@ -247,11 +273,13 @@ def test_missing_values_are_actionable(test_env, monkeypatch, capsys):
 def test_no_sample_course_data_in_product_code():
     banned = re.compile(r"AIML|machine learning|modern history|gpt-|claude-", re.I)
     co1 = re.compile(r"\bCO1\b")
-    hits = []
+    hits, scanned = [], 0
     for base in (ROOT / "src", ROOT / "config"):
         for p in base.rglob("*"):
             if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc":
+                scanned += 1
                 text = p.read_text(encoding="utf-8", errors="ignore")
                 if banned.search(text) or co1.search(text):
                     hits.append(str(p))
+    assert scanned > 0
     assert hits == []
