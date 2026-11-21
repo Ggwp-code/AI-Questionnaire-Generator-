@@ -12,7 +12,9 @@ from tribunal.errors import TribunalError
 
 
 def create_app(ctx: AppContext) -> FastAPI:
-    app = FastAPI(title=ctx.settings.app_name)
+    # the body is capped before it is parsed or spooled to disk; the exact check stays in the upload handler
+    limit = ctx.snapshot.config.ingestion.max_upload_bytes + 1024 * 1024
+    app = FastAPI(title=ctx.settings.app_name, max_body_size=limit)
     app.state.ctx = ctx
     app.add_middleware(
         CORSMiddleware, allow_origins=ctx.settings.allowed_origins, allow_methods=["*"], allow_headers=["*"]

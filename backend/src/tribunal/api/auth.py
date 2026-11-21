@@ -51,6 +51,5 @@ def authenticate(request: Request, ctx: AppContext, session: Session) -> User:
     if not email.strip():
         raise Unauthorized("sign in required")
     user = get_or_create_user(session, ctx, email)
-    if user.email in ctx.settings.admin_emails and not user.is_admin:
-        user.is_admin = True
+    user.is_admin = user.email in ctx.settings.admin_emails  # follows ADMIN_EMAILS both ways
     return user

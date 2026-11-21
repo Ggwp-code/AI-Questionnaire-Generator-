@@ -212,3 +212,48 @@ def test_no_ready_documents(client):
 def test_slot_rows_exist(ctx, paper):
     with ctx.session_factory() as s:
         assert s.query(Slot).filter_by(paper_id=paper).count() == 3
+
+
+def test_oversized_body_rejected_before_sign_in(ctx):
+    ing = ctx.snapshot.config.ingestion.model_copy(update={"max_upload_bytes": 1000})
+    cfg = ctx.snapshot.config.model_copy(update={"ingestion": ing})
+    ctx.snapshot = ctx.snapshot.model_copy(update={"config": cfg})
+    c = TestClient(create_app(ctx))
+    r = c.post("/api/subjects/x/documents", files={"file": ("d.pdf", b"%PDF-" + b"0" * (1024 * 1024 + 2000))})
+    assert r.status_code == 413  # not 401: the limit runs first
+
+
+def test_commit_failure_is_visible(client, ctx, request):
+    # the commit must happen before the response is sent, so a failure cannot hide behind a 2xx
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session
+
+    def mark(session, _ctx):
+        if any(type(o).__name__ == "Subject" for o in session.new):
+            session.info["boom"] = True
+
+    def boom(session):
+        if session.info.get("boom"):
+            raise RuntimeError("commit failed")
+
+    event.listen(Session, "after_flush", mark)
+    event.listen(Session, "before_commit", boom)
+    request.addfinalizer(lambda: (event.remove(Session, "after_flush", mark),
+                                  event.remove(Session, "before_commit", boom)))
+    c = TestClient(create_app(ctx), raise_server_exceptions=False)
+    assert c.post("/api/subjects", json={"name": "S"}, headers=h(A)).status_code == 500
+
+
+def test_admin_revoked_when_removed_from_admin_emails(client, ctx, monkeypatch):
+    from tribunal.context import build_context
+
+    sid = mk_subject(client, A)
+    monkeypatch.setenv("ADMIN_EMAILS", B)
+    from tribunal.settings import load_settings
+
+    admin_ctx = build_context(load_settings(), ocr_override=ctx.ocr_override)
+    c = TestClient(create_app(admin_ctx))
+    assert c.get(f"/api/subjects/{sid}/documents", headers=h(B)).status_code == 200
+    monkeypatch.delenv("ADMIN_EMAILS")
+    plain = TestClient(create_app(build_context(load_settings(), ocr_override=ctx.ocr_override)))
+    assert plain.get(f"/api/subjects/{sid}/documents", headers=h(B)).status_code == 404

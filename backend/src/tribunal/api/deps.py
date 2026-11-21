@@ -22,7 +22,11 @@ def get_session(ctx: AppContext = Depends(get_ctx)) -> Iterator[Session]:
         yield session
 
 
-def current_user(request: Request, ctx: AppContext = Depends(get_ctx), session: Session = Depends(get_session)) -> User:
+# function scope: the commit happens before the response is sent, so a failed commit is a visible error
+DB = Depends(get_session, scope="function")
+
+
+def current_user(request: Request, ctx: AppContext = Depends(get_ctx), session: Session = DB) -> User:
     return authenticate(request, ctx, session)
 
 

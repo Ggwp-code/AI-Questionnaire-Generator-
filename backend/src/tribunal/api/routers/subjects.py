@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tribunal.api.auth import get_or_create_user
-from tribunal.api.deps import current_user, get_ctx, get_session, require_member
+from tribunal.api.deps import DB, current_user, get_ctx, require_member
 from tribunal.context import AppContext
 from tribunal.db.models import Subject, SubjectMember, User
 from tribunal.errors import Forbidden
@@ -30,7 +30,7 @@ def me(user: User = Depends(current_user)) -> dict:
 
 
 @router.post("/subjects", status_code=201)
-def create_subject(body: Named, user: User = Depends(current_user), session: Session = Depends(get_session)) -> dict:
+def create_subject(body: Named, user: User = Depends(current_user), session: Session = DB) -> dict:
     subject = Subject(name=body.name.strip(), owner_id=user.id)
     session.add(subject)
     session.flush()
@@ -39,7 +39,7 @@ def create_subject(body: Named, user: User = Depends(current_user), session: Ses
 
 
 @router.get("/subjects")
-def list_subjects(user: User = Depends(current_user), session: Session = Depends(get_session)) -> list[dict]:
+def list_subjects(user: User = Depends(current_user), session: Session = DB) -> list[dict]:
     rows = session.execute(
         select(Subject, SubjectMember.role).join(SubjectMember, SubjectMember.subject_id == Subject.id)
         .where(SubjectMember.user_id == user.id).order_by(Subject.created_at, Subject.id)
@@ -48,7 +48,7 @@ def list_subjects(user: User = Depends(current_user), session: Session = Depends
 
 
 @router.post("/subjects/{sid}/members", status_code=201)
-def add_member(sid: str, body: MemberIn, user: User = Depends(current_user), session: Session = Depends(get_session),
+def add_member(sid: str, body: MemberIn, user: User = Depends(current_user), session: Session = DB,
                ctx: AppContext = Depends(get_ctx)) -> dict:
     subject = require_member(session, sid, user)
     mine = session.get(SubjectMember, (sid, user.id))

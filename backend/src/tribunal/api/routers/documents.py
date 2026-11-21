@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from tribunal.api.deps import current_user, get_ctx, get_session, require_member
+from tribunal.api.deps import DB, current_user, get_ctx, require_member
 from tribunal.context import AppContext
 from tribunal.db.models import Document, Passage, Topic, User
 from tribunal.db.types import new_id
@@ -45,7 +45,7 @@ def page_url(document_id: str, page: int) -> str:
 
 @router.post("/subjects/{sid}/documents", status_code=202)
 def upload(sid: str, file: UploadFile = File(...), languages: str | None = Form(None),
-           user: User = Depends(current_user), session: Session = Depends(get_session),
+           user: User = Depends(current_user), session: Session = DB,
            ctx: AppContext = Depends(get_ctx)) -> dict:
     require_member(session, sid, user)
     ing = ctx.snapshot.config.ingestion
@@ -71,14 +71,14 @@ def upload(sid: str, file: UploadFile = File(...), languages: str | None = Form(
 
 
 @router.get("/subjects/{sid}/documents")
-def list_documents(sid: str, user: User = Depends(current_user), session: Session = Depends(get_session)) -> list[dict]:
+def list_documents(sid: str, user: User = Depends(current_user), session: Session = DB) -> list[dict]:
     require_member(session, sid, user)
     docs = session.scalars(select(Document).where(Document.subject_id == sid).order_by(Document.created_at, Document.id))
     return [_doc_json(d) for d in docs]
 
 
 @router.get("/documents/{did}/file")
-def download(did: str, user: User = Depends(current_user), session: Session = Depends(get_session),
+def download(did: str, user: User = Depends(current_user), session: Session = DB,
              ctx: AppContext = Depends(get_ctx)) -> Response:
     doc = session.get(Document, did)
     if doc is None:
@@ -88,7 +88,7 @@ def download(did: str, user: User = Depends(current_user), session: Session = De
 
 
 @router.get("/subjects/{sid}/topics")
-def list_topics(sid: str, user: User = Depends(current_user), session: Session = Depends(get_session)) -> list[dict]:
+def list_topics(sid: str, user: User = Depends(current_user), session: Session = DB) -> list[dict]:
     require_member(session, sid, user)
     return [_topic_json(t) for t in session.scalars(
         select(Topic).where(Topic.subject_id == sid).order_by(Topic.created_at, Topic.page_start, Topic.id))]
@@ -96,7 +96,7 @@ def list_topics(sid: str, user: User = Depends(current_user), session: Session =
 
 @router.post("/subjects/{sid}/topics", status_code=201)
 def create_topic(sid: str, body: TitleIn, user: User = Depends(current_user),
-                 session: Session = Depends(get_session)) -> dict:
+                 session: Session = DB) -> dict:
     require_member(session, sid, user)
     topic = Topic(subject_id=sid, title=body.title.strip(), source="faculty")
     session.add(topic)
@@ -106,7 +106,7 @@ def create_topic(sid: str, body: TitleIn, user: User = Depends(current_user),
 
 @router.patch("/topics/{tid}")
 def rename_topic(tid: str, body: TitleIn, user: User = Depends(current_user),
-                 session: Session = Depends(get_session)) -> dict:
+                 session: Session = DB) -> dict:
     topic = session.get(Topic, tid)
     if topic is None:
         raise NotFound("topic not found")
@@ -116,7 +116,7 @@ def rename_topic(tid: str, body: TitleIn, user: User = Depends(current_user),
 
 
 @router.get("/passages/{pid}")
-def get_passage(pid: str, user: User = Depends(current_user), session: Session = Depends(get_session)) -> dict:
+def get_passage(pid: str, user: User = Depends(current_user), session: Session = DB) -> dict:
     passage = session.get(Passage, pid)
     if passage is None:
         raise NotFound("passage not found")

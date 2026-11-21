@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from tribunal.api.deps import current_user, get_ctx, get_session, require_member
+from tribunal.api.deps import DB, current_user, get_ctx, require_member
 from tribunal.api.routers.documents import page_url
 from tribunal.context import AppContext
 from tribunal.db.models import Document, Paper, PaperTemplate, Passage, Revision, Slot, Topic, User
@@ -47,7 +47,7 @@ def _tpl_json(t: PaperTemplate) -> dict:
 
 
 @router.post("/templates", status_code=201)
-def create_template(body: TemplateIn, user: User = Depends(current_user), session: Session = Depends(get_session),
+def create_template(body: TemplateIn, user: User = Depends(current_user), session: Session = DB,
                     ctx: AppContext = Depends(get_ctx)) -> dict:
     expand_blueprint(parse_template_spec(body.spec), ["probe"], ctx.snapshot.config)  # surface problems now
     latest = session.scalar(select(func.max(PaperTemplate.version)).where(
@@ -59,14 +59,14 @@ def create_template(body: TemplateIn, user: User = Depends(current_user), sessio
 
 
 @router.get("/templates")
-def list_templates(user: User = Depends(current_user), session: Session = Depends(get_session)) -> list[dict]:
+def list_templates(user: User = Depends(current_user), session: Session = DB) -> list[dict]:
     return [_tpl_json(t) for t in session.scalars(
         select(PaperTemplate).where(PaperTemplate.owner_id == user.id)
         .order_by(PaperTemplate.name, PaperTemplate.version))]
 
 
 @router.post("/papers", status_code=202)
-def create_paper(body: PaperIn, user: User = Depends(current_user), session: Session = Depends(get_session),
+def create_paper(body: PaperIn, user: User = Depends(current_user), session: Session = DB,
                  ctx: AppContext = Depends(get_ctx)) -> dict:
     require_member(session, body.subject_id, user)
     tpl = session.get(PaperTemplate, body.template_id)
@@ -126,7 +126,7 @@ def _seconds(start: datetime, end: datetime | None) -> float | None:
 
 
 @router.get("/papers/{pid}")
-def get_paper(pid: str, user: User = Depends(current_user), session: Session = Depends(get_session)) -> dict:
+def get_paper(pid: str, user: User = Depends(current_user), session: Session = DB) -> dict:
     paper = load_paper(session, user, pid)
     tpl = session.get(PaperTemplate, paper.template_id)
     slots = session.scalars(select(Slot).where(Slot.paper_id == pid).order_by(Slot.number)).all()
@@ -155,7 +155,7 @@ def get_paper(pid: str, user: User = Depends(current_user), session: Session = D
 
 
 @router.post("/papers/{pid}/slots/{n}/regenerate", status_code=202)
-def regenerate(pid: str, n: int, user: User = Depends(current_user), session: Session = Depends(get_session),
+def regenerate(pid: str, n: int, user: User = Depends(current_user), session: Session = DB,
                ctx: AppContext = Depends(get_ctx)) -> dict:
     slot = _slot(session, load_paper(session, user, pid), n)
     if slot.status in ("pending", "running"):
@@ -169,7 +169,7 @@ def regenerate(pid: str, n: int, user: User = Depends(current_user), session: Se
 
 @router.put("/papers/{pid}/slots/{n}")
 def edit_slot(pid: str, n: int, body: EditIn, user: User = Depends(current_user),
-              session: Session = Depends(get_session), ctx: AppContext = Depends(get_ctx)) -> dict:
+              session: Session = DB, ctx: AppContext = Depends(get_ctx)) -> dict:
     paper = load_paper(session, user, pid)
     slot = _slot(session, paper, n)
     if slot.status in ("pending", "running"):
@@ -197,7 +197,7 @@ def edit_slot(pid: str, n: int, body: EditIn, user: User = Depends(current_user)
 
 
 @router.post("/papers/{pid}/slots/{n}/approve")
-def approve(pid: str, n: int, user: User = Depends(current_user), session: Session = Depends(get_session)) -> dict:
+def approve(pid: str, n: int, user: User = Depends(current_user), session: Session = DB) -> dict:
     slot = _slot(session, load_paper(session, user, pid), n)
     if slot.status not in ("drafted", "needs_review") or not slot.current_revision_id:
         raise Conflict("only a drafted or needs_review slot with a revision can be approved")
@@ -209,7 +209,7 @@ def approve(pid: str, n: int, user: User = Depends(current_user), session: Sessi
 
 @router.get("/papers/{pid}/export")
 def export(pid: str, part: Literal["paper", "key"], format: Literal["json", "pdf"] = "json",
-           user: User = Depends(current_user), session: Session = Depends(get_session),
+           user: User = Depends(current_user), session: Session = DB,
            ctx: AppContext = Depends(get_ctx)):
     paper = load_paper(session, user, pid)
     snap = ctx.snapshot_for(paper.config_snapshot_id)
