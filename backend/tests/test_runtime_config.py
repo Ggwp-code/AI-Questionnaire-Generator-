@@ -49,3 +49,14 @@ def test_unknown_role_provider(test_env):
     with pytest.raises(ConfigurationError) as exc:
         load_runtime_config(copy)
     assert any("roles.writer.provider 'missing' is not defined under providers" in p for p in exc.value.problems)
+
+
+def test_lease_must_exceed_deadline(test_env):
+    text = test_env["runtime"].read_text()
+    text = text.replace("../../config/prompts", str(test_env["runtime"].parent.parent.parent / "config" / "prompts"))
+    copy = test_env["tmp"] / "runtime.yaml"
+    copy.write_text(text.replace("lease_seconds: 900", "lease_seconds: 600"))
+    with pytest.raises(ConfigurationError) as exc:
+        load_runtime_config(copy)
+    assert any("retries.lease_seconds must be greater than budgets.paper_deadline_seconds" in p
+               for p in exc.value.problems)

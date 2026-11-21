@@ -86,7 +86,7 @@ retries:
   max_attempts: 3
   base_delay_seconds: 0.01
   max_delay_seconds: 0.05
-  lease_seconds: 300
+  lease_seconds: 900
   poll_interval_seconds: 0.05
 budgets:
   paper_tokens: 200000

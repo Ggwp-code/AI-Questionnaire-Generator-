@@ -15,6 +15,9 @@ from tribunal.runtime_config import ConfigSnapshot
 
 def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str) -> None:
     with ctx.session_factory.begin() as s:
+        # running slots are orphans of an earlier attempt of this job
+        for orphan in s.scalars(select(Slot).where(Slot.paper_id == paper_id, Slot.status == "running")):
+            orphan.status = "pending"
         paper = s.get(Paper, paper_id)
         paper.status = "running"
         if paper.started_at is None:
@@ -23,7 +26,7 @@ def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str) -> None:
                                   .order_by(Slot.number)))
     # fill the unlocked caches before threads share them
     ctx.embedder(snapshot)
-    for role in ("writer", "reviewer", "reasoner"):
+    for role in snapshot.config.roles:
         ctx.provider(snapshot, role)
 
     def one(slot_id: str) -> None:

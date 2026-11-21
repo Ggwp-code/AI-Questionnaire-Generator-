@@ -6,6 +6,8 @@ import logging
 import threading
 from collections.abc import Callable
 
+from sqlalchemy import select
+
 from tribunal.context import AppContext
 from tribunal.db.models import Document, Paper, Slot
 from tribunal.generation.papers import regenerate, run_paper
@@ -41,6 +43,10 @@ def _paper_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
         if paper is not None:
             paper.status = "failed"
             paper.error = error
+        for slot in session.scalars(select(Slot).where(Slot.paper_id == job.target_id,
+                                                       Slot.status.in_(("pending", "running")))):
+            slot.status = "failed"
+            slot.status_detail = f"paper generation failed: {error}"
 
 
 def _slot_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
@@ -48,7 +54,7 @@ def _slot_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
         slot = session.get(Slot, job.target_id)
         if slot is not None:
             slot.status = "failed"
-            slot.status_detail = error
+            slot.status_detail = f"regeneration failed: {error}"
 
 
 HANDLERS: dict[str, Callable[[AppContext, ClaimedJob], None]] = {

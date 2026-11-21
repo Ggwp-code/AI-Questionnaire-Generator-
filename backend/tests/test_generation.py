@@ -244,3 +244,38 @@ def test_worker_runs_generate_job(gen):
     assert run_once(ctx) is True
     with ctx.session_factory() as s:
         assert s.get(Paper, pid).status == "drafted"
+
+
+def test_no_reasoner_role(test_env, monkeypatch, fake_ocr, fake_holder):
+    src = test_env["runtime"]
+    text = src.read_text().replace("../../config", f"{src.parent.parent.parent}/config")
+    text = re.sub(r"  reasoner:\n(    .*\n)+", "", text)
+    text = text.replace("escalate_disputed_reviews: true", "escalate_disputed_reviews: false")
+    new = test_env["tmp"] / "runtime.yaml"
+    new.write_text(text)
+    monkeypatch.setenv("RUNTIME_CONFIG", str(new))
+    reset_settings_cache()
+    from tribunal.settings import load_settings
+    ctx = make_ctx(load_settings(), fake_ocr, fake_holder)
+    assert "reasoner" not in ctx.snapshot.config.roles
+    assert {s.status for s in go(ctx, make_paper(ctx)[0])} == {"drafted"}
+
+
+def test_running_slot_is_rerun(gen):
+    ctx, pid, _ = gen
+    with ctx.session_factory.begin() as s:
+        s.query(Slot).filter_by(paper_id=pid, number=1).one().status = "running"
+    assert {s.status for s in go(ctx, pid)} == {"drafted"}
+
+
+def test_final_failure_fails_open_slots(gen):
+    from tribunal.jobs.queue import ClaimedJob
+    from tribunal.jobs.worker import FINAL_FAILURE
+    ctx, pid, _ = gen
+    with ctx.session_factory.begin() as s:
+        s.query(Slot).filter_by(paper_id=pid, number=1).one().status = "running"
+    FINAL_FAILURE["generate_paper"](ctx, ClaimedJob("j", "generate_paper", pid, ctx.snapshot.snapshot_id, 3), "boom")
+    sl = slots(ctx, pid)
+    assert {s.status for s in sl} == {"failed"} and all("boom" in s.status_detail for s in sl)
+    with ctx.session_factory() as s:
+        assert s.get(Paper, pid).status == "failed"
