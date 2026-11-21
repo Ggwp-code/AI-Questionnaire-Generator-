@@ -20,6 +20,10 @@ log = logging.getLogger(__name__)
 
 def _ingest(ctx: AppContext, job: ClaimedJob) -> None:
     ingest_document(ctx, ctx.snapshot_for(job.config_snapshot_id), job.target_id)
+    with ctx.session_factory() as session:
+        doc = session.get(Document, job.target_id)
+        if doc.status == "failed":  # a domain failure (bad PDF, limits): retrying cannot help
+            raise _PermanentFailure(doc.error)
 
 
 def _ingest_failed(ctx: AppContext, job: ClaimedJob, error: str) -> None:
@@ -100,15 +104,16 @@ def run_once(ctx: AppContext) -> bool:
     try:
         if job.attempts > retries.max_attempts:
             # Reclaimed after lease expiry too often: the worker likely dies on this job.
-            raise _Abandoned(f"job abandoned after {job.attempts - 1} attempts; the worker stopped while processing it")
+            raise _PermanentFailure(
+                f"job abandoned after {job.attempts - 1} attempts; the worker stopped while processing it")
         handler = HANDLERS.get(job.kind)
         if handler is None:
-            raise _Abandoned(f"unknown job kind '{job.kind}'")
+            raise _PermanentFailure(f"unknown job kind '{job.kind}'")
         with _lease_kept(ctx, job, retries.lease_seconds):
             handler(ctx, job)
     except Exception as exc:
         log.exception("job %s (%s) failed", job.id, job.kind)
-        max_attempts = 0 if isinstance(exc, _Abandoned) else retries.max_attempts
+        max_attempts = 0 if isinstance(exc, _PermanentFailure) else retries.max_attempts
         requeued = fail_job(ctx.session_factory, job.id, job.attempts, str(exc), max_attempts)
         if requeued is False and (hook := FINAL_FAILURE.get(job.kind)):
             hook(ctx, job, str(exc))
@@ -121,7 +126,7 @@ def run_once(ctx: AppContext) -> bool:
     return True
 
 
-class _Abandoned(Exception):
+class _PermanentFailure(Exception):
     """A job that must fail now, without further retries."""
 
 

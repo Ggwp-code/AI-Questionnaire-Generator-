@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import pytest
 from conftest import make_subject, make_user
+from pdf_fixtures import digital_pdf
 
 from tribunal.db.models import Document, Job
 from tribunal.db.types import utcnow
@@ -174,3 +175,17 @@ def test_heartbeat_keeps_long_job_leased(ctx, monkeypatch):
     assert worker.run_once(ctx) is True
     assert stolen and not any(stolen)
     assert _job_status(ctx, a) == ("done", None)
+
+
+@pytest.mark.parametrize("readable", [False, True])
+def test_ingest_job_reports_document_outcome(ctx, readable):
+    ctx.store.put("k", digital_pdf(["Decision trees split data. " * 20]) if readable else b"not a pdf")
+    doc_id = _doc(ctx)
+    with ctx.session_factory.begin() as s:
+        job_id = enqueue(s, "ingest", doc_id, ctx.snapshot.snapshot_id).id
+    assert worker.run_once(ctx) is True
+    with ctx.session_factory() as s:
+        job, doc = s.get(Job, job_id), s.get(Document, doc_id)
+        error = None if readable else "file is not a readable PDF"
+        assert (job.status, job.error, job.attempts) == ("done" if readable else "failed", error, 1)
+        assert (doc.status, doc.error) == ("ready" if readable else "failed", error)
