@@ -10,6 +10,10 @@ def test_terms():
     assert terms("Decision trees and a tree, CAFÉ") == {"decision", "tree", "and", "café"}
 
 
+def test_terms_keep_short_technical_tokens():
+    assert terms("pH and AI in ML, 3D at 12 To Of") == {"ph", "and", "ai", "ml", "3d"}
+
+
 def test_hashing_deterministic():
     a = HashingEmbedder(64).embed(["decision tree", "entropy"])
     b = HashingEmbedder(64).embed(["decision tree", "entropy"])
@@ -29,7 +33,7 @@ def test_zero_text():
 
 def test_model_id_and_factory():
     cfg = EmbeddingConfig(provider="hashing", model="x", dimensions=16)
-    assert make_embedder(cfg).model_id == "hashing-16"
+    assert make_embedder(cfg).model_id == "hashing2-16"
 
 
 def test_openai_embedding_unavailable():

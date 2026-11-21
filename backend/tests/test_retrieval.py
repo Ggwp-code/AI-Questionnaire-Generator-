@@ -86,3 +86,18 @@ def test_version_stable(ctx, world):
     assert v == _go(ctx, a, [doc_a], "trees").version
     other = cfg.model_copy(update={"min_score": min(cfg.min_score + 0.01, 1.0) if cfg.min_score < 1 else 0.0})
     assert v != _go(ctx, a, [doc_a], "trees", cfg=other).version
+
+
+@pytest.mark.parametrize("page, query, found", [
+    ("The pH of a solution measures how acidic it is. ", "pH", True),
+    ("The French Revolution overthrew the monarchy of France. ", "Theory of Computation", False),
+])
+def test_short_terms_match_but_function_words_do_not(ctx, page, query, found):
+    with ctx.session_factory.begin() as s:
+        user = make_user(s, "p@example.com")
+        a = make_subject(s, user, "A")
+        doc = _ingest(ctx, s, user, a, "p.pdf", digital_pdf([page * 5], []))
+        sid = a.id
+    ingest_document(ctx, ctx.snapshot, doc)
+    r = _go(ctx, sid, [doc], query, topic=Topic(subject_id=sid, title=query, source="faculty"))
+    assert (r.gap is None) == found

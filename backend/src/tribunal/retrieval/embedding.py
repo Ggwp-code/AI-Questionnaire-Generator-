@@ -14,10 +14,17 @@ from tribunal.runtime_config import EmbeddingConfig
 _WORD = regex.compile(r"\w+")
 
 
+def _technical(tok: str) -> bool:
+    """A two-character token that names something: "AI", "pH", "3D", "H2"; not "of", "To" or "12"."""
+    mixed = any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok)
+    return len(tok) == 2 and (tok[1].isupper() or mixed)
+
+
 def terms(text: str) -> set[str]:
     out = set()
-    for tok in _WORD.findall(text.lower()):
-        if len(tok) >= 3:
+    for raw in _WORD.findall(text):
+        if len(raw) >= 3 or _technical(raw):
+            tok = raw.lower()
             out.add(tok[:-1] if len(tok) > 3 and tok.endswith("s") else tok)
     return out
 
@@ -36,7 +43,8 @@ class Embedder(Protocol):
 class HashingEmbedder:
     def __init__(self, dimensions: int):
         self.dimensions = dimensions
-        self.model_id = f"hashing-{dimensions}"
+        # bump when terms() changes: the id is part of the extraction version
+        self.model_id = f"hashing2-{dimensions}"
 
     def embed(self, texts: list[str]) -> np.ndarray:
         m = np.zeros((len(texts), self.dimensions), dtype=np.float32)
