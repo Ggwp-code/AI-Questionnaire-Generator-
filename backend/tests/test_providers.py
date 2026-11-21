@@ -105,3 +105,21 @@ def test_anthropic_not_available():
 
 def test_make_stub():
     assert isinstance(make_provider("stub", PCFG), StubProvider)
+
+
+def test_context_provider_cached(ctx):
+    a, role = ctx.provider(ctx.snapshot, "writer")
+    assert a is ctx.provider(ctx.snapshot, "writer")[0]
+    assert role.model == ctx.snapshot.config.roles["writer"].model
+
+
+def test_context_uses_provider_factory(settings, fake_ocr):
+    from tribunal.context import build_context
+
+    calls = []
+    sentinel = object()
+    c = build_context(settings, ocr_override=fake_ocr, migrate=True,
+                      provider_factory=lambda name, cfg: calls.append(name) or sentinel)
+    assert c.provider(c.snapshot, "writer")[0] is sentinel
+    c.provider(c.snapshot, "reviewer")
+    assert calls == ["stub"]
