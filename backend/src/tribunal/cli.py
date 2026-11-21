@@ -1,0 +1,72 @@
+"""Command line entry point: configuration check and plain-text scan."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import yaml
+
+from tribunal.errors import ConfigurationError
+from tribunal.runtime_config import load_runtime_config
+from tribunal.settings import load_settings
+from tribunal.textpolicy import TextPolicy
+
+SCAN_SUFFIXES = {".py", ".md", ".yaml", ".yml", ".toml", ".txt", ".json", ".ts", ".tsx", ".html", ".css", ".sh", ".ini", ".mako"}
+SKIP_DIRS = {"__pycache__", ".venv", "node_modules"}
+
+
+def _check_config() -> int:
+    try:
+        snapshot = load_runtime_config(load_settings().runtime_config)
+    except ConfigurationError as exc:
+        for problem in exc.problems:
+            print(f"- {problem}", file=sys.stderr)
+        return 2
+    print(f"OK {snapshot.snapshot_id}")
+    return 0
+
+
+def _files(paths: list[str]):
+    for raw in paths:
+        root = Path(raw)
+        candidates = [root] if root.is_file() else sorted(root.rglob("*"))
+        for p in candidates:
+            if p.is_file() and p.suffix in SCAN_SUFFIXES and not SKIP_DIRS.intersection(p.parts):
+                yield p
+
+
+def _scan_text(config: str, paths: list[str]) -> int:
+    # Read the preserve list without interpolation so no environment is needed.
+    raw = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
+    policy = TextPolicy(raw["text_policy"]["preserve_codepoints"])
+    found = 0
+    for path in _files(paths):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as exc:
+            print(f"{path}: not scanned ({exc})", file=sys.stderr)
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for finding in policy.findings(line):
+                found += 1
+                print(f"{path}:{lineno}:{finding.index + 1} {finding.codepoints}")
+    return 1 if found else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="tribunal")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("check-config", help="validate settings and runtime configuration")
+    scan = sub.add_parser("scan-text", help="report emoji in text files")
+    scan.add_argument("--config", required=True)
+    scan.add_argument("paths", nargs="+")
+    args = parser.parse_args(argv)
+    if args.command == "check-config":
+        return _check_config()
+    return _scan_text(args.config, args.paths)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

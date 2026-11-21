@@ -1,0 +1,99 @@
+version: "test-1"
+providers:
+  stub: {kind: stub, max_concurrent: 4, timeout_seconds: 5}
+roles:
+  writer:
+    provider: stub
+    model: "${TRIBUNAL_WRITER_MODEL:-stub-writer}"
+    prompt: writer
+    max_output_tokens: 2000
+  reviewer:
+    provider: stub
+    model: "${TRIBUNAL_REVIEWER_MODEL:-stub-reviewer}"
+    prompt: reviewer
+    max_output_tokens: 1000
+  reasoner:
+    provider: stub
+    model: "stub-reasoner"
+    prompt: reviewer
+    max_output_tokens: 2000
+prompts:
+  writer: {file: ../../config/prompts/writer.yaml}
+  reviewer: {file: ../../config/prompts/reviewer.yaml}
+retrieval:
+  embedding: {provider: hashing, model: hashing-v1, dimensions: 256}
+  chunk_chars: 800
+  chunk_overlap_chars: 100
+  candidate_k: 20
+  top_k: 4
+  min_score: 0.15
+  min_passages: 1
+  vector_weight: 0.5
+  lexical_weight: 0.5
+  topic_page_boost: 0.2
+  require_term_match: true
+  source_kinds: [native, ocr, layout]
+ingestion:
+  max_upload_bytes: 20000000
+  max_pages: 400
+  batch_pages: 20
+  native_min_chars: 40
+  mixed_image_coverage: 0.5
+  ocr:
+    engine: ocrmypdf
+    languages: ["${TRIBUNAL_OCR_LANGUAGE:-eng}"]
+    rotate_pages: true
+    deskew: true
+    timeout_seconds: 600
+    jobs: 1
+  layout: {engine: none, review_required: false}
+  flag_formulas_on: [ocr]
+  flag_tables_on: [ocr]
+  flagged_page_policy: exclude
+  outline: {use_bookmarks: true, use_contents_page: true, use_headings: true, contents_search_pages: 12, max_topics: 60}
+generation:
+  question_types:
+    short_answer: {label: "Short answer", enabled: true}
+  bloom_levels:
+    - {key: remember, label: Remember, description: Recall facts from the source}
+    - {key: understand, label: Understand, description: Explain ideas in own words}
+    - {key: apply, label: Apply, description: Use a concept in a new situation}
+    - {key: analyze, label: Analyze, description: Break a topic into parts and relate them}
+    - {key: evaluate, label: Evaluate, description: Judge or justify a position}
+    - {key: create, label: Create, description: Produce a new design or argument}
+  difficulty_levels:
+    - {key: easy, label: Easy, description: Direct recall or a single step}
+    - {key: medium, label: Medium, description: A few steps or a comparison}
+    - {key: hard, label: Hard, description: Multi-step reasoning}
+  mcq_option_count: 4
+  max_revisions: 1
+  reviewer_enabled: true
+  escalate_disputed_reviews: true
+  numeric_relative_tolerance: 0.01
+  duplicate_similarity: 0.9
+  placeholder_patterns:
+    - '(?i)error generating'
+    - '^\s*\[.*\]\s*$'
+    - '(?i)lorem ipsum'
+    - '(?i)\bTODO\b'
+    - '(?i)sample question'
+concurrency:
+  worker_threads: 2
+  per_paper: "${TRIBUNAL_PER_PAPER:-2}"
+  per_user: 2
+  ingestion_per_user: 1
+retries:
+  max_attempts: 3
+  base_delay_seconds: 0.01
+  max_delay_seconds: 0.05
+  lease_seconds: 300
+  poll_interval_seconds: 0.05
+budgets:
+  paper_tokens: 200000
+  reserve_per_call: 4000
+  paper_deadline_seconds: 600
+events: {poll_interval_seconds: 1.0, heartbeat_seconds: 15.0}
+text_policy:
+  preserve_codepoints: ["0023", "002A", "0030-0039", "00A9", "00AE", "2122", "2139", "2194-2199", "21A9-21AA", "27A1", "2934-2935", "2B05-2B07", "2640", "2642", "2660", "2663", "2665", "2666"]
+export: {pdf_font_size: 11, pdf_margin_mm: 18, include_citations_in_answer_key: true}
+observability: {include_paper_text_in_logs: false}
