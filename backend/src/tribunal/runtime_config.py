@@ -232,6 +232,8 @@ class RuntimeConfig(_Strict):
             problems.append("retrieval.top_k must not exceed retrieval.candidate_k")
         if self.retrieval.chunk_overlap_chars >= self.retrieval.chunk_chars:
             problems.append("retrieval.chunk_overlap_chars must be smaller than retrieval.chunk_chars")
+        if self.retries.lease_seconds <= self.budgets.paper_deadline_seconds:
+            problems.append("retries.lease_seconds must be greater than budgets.paper_deadline_seconds")
         if problems:
             raise ValueError("; ".join(problems))
         return self
