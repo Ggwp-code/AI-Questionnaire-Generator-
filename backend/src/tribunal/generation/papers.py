@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 from sqlalchemy import select
 
@@ -14,6 +15,7 @@ from tribunal.runtime_config import ConfigSnapshot
 
 
 def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str) -> None:
+    deadline = utcnow() + timedelta(seconds=snapshot.config.budgets.paper_deadline_seconds)
     with ctx.session_factory.begin() as s:
         # running slots are orphans of an earlier attempt of this job
         for orphan in s.scalars(select(Slot).where(Slot.paper_id == paper_id, Slot.status == "running")):
@@ -31,7 +33,7 @@ def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str) -> None:
 
     def one(slot_id: str) -> None:
         try:
-            generate_slot(ctx, snapshot, slot_id)
+            generate_slot(ctx, snapshot, slot_id, deadline=deadline)
         except Exception as exc:
             _finish(ctx, slot_id, "failed", f"{type(exc).__name__}: {exc}")
 

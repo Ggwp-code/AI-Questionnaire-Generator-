@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import timedelta
 
 import pytest
 from conftest import make_subject, make_user
@@ -9,10 +10,12 @@ from pdf_fixtures import digital_pdf
 
 from tribunal.context import build_context
 from tribunal.db.models import Document, Paper, PaperTemplate, Passage, Revision, Slot, Topic
+from tribunal.db.types import utcnow
 from tribunal.generation.blueprint import expand_blueprint, parse_template_spec
 from tribunal.generation.papers import regenerate, run_paper
 from tribunal.generation.providers.base import ProviderError
 from tribunal.generation.providers.stub import StubProvider
+from tribunal.generation.slots import generate_slot
 from tribunal.ingestion.pipeline import ingest_document
 from tribunal.jobs.queue import enqueue
 from tribunal.jobs.worker import run_once
@@ -226,6 +229,24 @@ def test_regenerate_preserves_others(gen):
     after = {s.number: s.current_revision_id for s in slots(ctx, pid)}
     assert after[1] == before[1] and after[3] == before[3] and after[2] != before[2]
     assert [r.number for r in revs(ctx, slots(ctx, pid)[1].id)] == [1, 2]
+
+
+def test_regenerate_after_original_paper_deadline(gen):
+    ctx, pid, _ = gen
+    go(ctx, pid)
+    with ctx.session_factory.begin() as s:
+        s.get(Paper, pid).created_at = utcnow() - timedelta(days=2)
+    regenerate(ctx, ctx.snapshot, slots(ctx, pid)[1].id)
+    slot = slots(ctx, pid)[1]
+    assert (slot.status, slot.status_detail) == ("drafted", None)
+
+
+def test_passed_deadline_fails_slot(gen):
+    ctx, pid, _ = gen
+    slot_id = slots(ctx, pid)[0].id
+    generate_slot(ctx, ctx.snapshot, slot_id, deadline=utcnow() - timedelta(seconds=1))
+    slot = slots(ctx, pid)[0]
+    assert (slot.status, slot.status_detail) == ("failed", "paper deadline exceeded")
 
 
 def test_concurrent_slots_sqlite(test_env, monkeypatch, fake_ocr, fake_holder):

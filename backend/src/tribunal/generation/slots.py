@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 
@@ -31,15 +31,19 @@ def _finish(ctx: AppContext, slot_id: str, status: str, detail: str | None) -> N
                 paper.first_question_at = utcnow()
 
 
-def generate_slot(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str) -> None:
+def generate_slot(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str, *,
+                  deadline: datetime | None = None) -> None:
+    """`deadline` belongs to the current generation run; by default it starts with this slot."""
+    deadline = deadline or utcnow() + timedelta(seconds=snapshot.config.budgets.paper_deadline_seconds)
     try:
-        status, detail = _generate(ctx, snapshot, slot_id)
+        status, detail = _generate(ctx, snapshot, slot_id, deadline)
     except (ProviderError, BudgetExhausted, _Stop) as exc:
         status, detail = "failed", str(exc)
     _finish(ctx, slot_id, status, detail)
 
 
-def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str) -> tuple[str, str | None]:
+def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
+              deadline: datetime) -> tuple[str, str | None]:
     cfg = snapshot.config
     g, budgets = cfg.generation, cfg.budgets
     policy = ctx.policy(snapshot)
@@ -49,7 +53,6 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str) -> tuple[
         paper = s.get(Paper, slot.paper_id)
         topic = s.get(Topic, slot.topic_id) if slot.topic_id else None
         paper_id, subject_id, doc_ids = paper.id, paper.subject_id, list(paper.document_ids)
-        deadline = paper.created_at + timedelta(seconds=budgets.paper_deadline_seconds)
         s.expunge_all()  # detached copies stay readable after the session closes
 
     def call(role_name: str, system: str, user: str) -> tuple[ProviderResult, str]:
