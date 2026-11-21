@@ -50,6 +50,23 @@ def _worker() -> int:
     return 0
 
 
+def _serve() -> int:
+    import uvicorn
+
+    from tribunal.api.app import create_app
+    from tribunal.context import build_context
+
+    settings = load_settings()
+    try:
+        ctx = build_context(settings, migrate=False)
+    except ConfigurationError as exc:
+        for problem in exc.problems:
+            print(f"- {problem}", file=sys.stderr)
+        return 2
+    uvicorn.run(create_app(ctx), host=settings.host, port=settings.port)
+    return 0
+
+
 def _files(paths: list[str], errors: list[str]):
     for raw in paths:
         root = Path(raw)
@@ -90,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check-config", help="validate settings and runtime configuration")
     sub.add_parser("db-upgrade", help="apply database migrations")
     sub.add_parser("worker", help="run the background job worker")
+    sub.add_parser("serve", help="run the HTTP API")
     scan = sub.add_parser("scan-text", help="report emoji in text files")
     scan.add_argument("--config", required=True)
     scan.add_argument("paths", nargs="+")
@@ -100,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         return _db_upgrade()
     if args.command == "worker":
         return _worker()
+    if args.command == "serve":
+        return _serve()
     return _scan_text(args.config, args.paths)
 
 
