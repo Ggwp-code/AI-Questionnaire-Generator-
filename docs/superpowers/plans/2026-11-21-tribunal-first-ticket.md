@@ -674,3 +674,51 @@ Run: `cd backend && ../.venv/bin/python -m pytest && ../.venv/bin/ruff check . &
 Expected: all pass, `All checks passed!`, scan exit 0.
 
 - [ ] **Step 6: Commit** `test(backend): first-ticket acceptance, CI workflow and setup guide`
+
+---
+
+### Task 14: Tightened first-ticket acceptance
+
+Source: reviewer feedback the user pasted on 2026-11-22 (keep the ticket as the first milestone; tighten acceptance in three places and make the missing-topic case its own request). The roadmap's "First implementation ticket" paragraph is updated to match (controller commit before this task).
+
+**Files:**
+- Modify: `backend/tests/test_acceptance.py`
+- Modify: `backend/src/tribunal/api/routers/documents.py` (documents list adds upload-to-searchable timing)
+- Create: `backend/tests/test_live_acceptance.py` (opt-in, skipped by default)
+- Modify: `backend/README.md` (timer definitions, pilot acceptance procedure)
+- Test: `backend/tests/test_acceptance.py`, `backend/tests/test_api.py`
+
+**Interfaces:**
+- Consumes: the API (`create_app`), `run_once`, `tribunal.jobs.queue.enqueue(session, kind, target_id, snapshot_id)`, `tests/pdf_fixtures.py`, `FakeOcrEngine`, the Task 12 routes, the user-bug fixes (re-ingest keeps cited passages; per-run deadline).
+- Produces: `GET /api/subjects/{sid}/documents` items gain `"ready_at"` (ISO time or null) and `"searchable_seconds"` (`ready_at - created_at` in seconds, null until ready).
+
+- [ ] **Step 1: Separate missing-topic request (replace the mixed "Trees" paper in `test_first_ticket`)**
+  - First, both instructors' papers: every slot `drafted` (three supported questions each).
+  - Then faculty B creates a faculty topic whose title is exactly one of faculty A's bookmark topics covered only in A's book (for example "Decision Trees") and requests a separate paper with only that topic.
+  - Assert: every slot of that paper is `evidence_gap`, its `revision` is null, its `citations` are `[]`, `status_detail` names the topic, and no passage id or document id of A's library appears anywhere in the JSON of that paper.
+  - Keep the existing direct-access refusals (B gets 404 on A's PDF, cited passage, paper and answer-key export).
+
+- [ ] **Step 2: Returning later (`test_return_later` in `test_acceptance.py`)**
+  - A's paper: approve all three slots; record each slot's revision id, citations and `approved_by`/`approved_at`; export the key (200) and record its citation passage ids.
+  - Simulate the next day: move the paper's `created_at` and `started_at` back by one day directly in the database.
+  - Regenerate slot 2 through the API and run the worker until idle.
+  - Assert: slots 1 and 3 keep their revision ids, citations, `approved` status and approval fields unchanged; slot 2 has a new revision id, status `drafted` or `needs_review`, and no approval; export key returns 409 `export_blocked` with "question 2 is not approved"; after approving slot 2 the export returns 200.
+  - Reprocess the identical book: enqueue an `ingest` job for A's document with the current snapshot id and run the worker until idle. Assert the document is `ready`, the key export still returns 200 with the same citation passage ids as before, and `GET /api/passages/{id}` returns 200 for each.
+
+- [ ] **Step 3: Timers**
+  - Definitions (README and code comments where the values are computed): the clock starts when the server accepts the paper request (`Paper.created_at`), so queue wait is included; `first_question_seconds` ends when the first slot reaches `drafted` or `needs_review` (after review); `total_seconds` ends when every slot has a visible outcome (`drafted`, `needs_review`, `evidence_gap` or `failed`); upload-to-searchable is measured separately as `Document.ready_at - Document.created_at`.
+  - Add `ready_at` and `searchable_seconds` to the documents list response.
+  - In `test_first_ticket`, sleep 0.2 s between the paper POST and running the worker, then assert `first_question_seconds >= 0.2` and `first_question_seconds <= total_seconds` for both papers, and that both documents report a non-null `searchable_seconds`. Print one line: `timings A=... B=... searchable A=... B=...`.
+
+- [ ] **Step 4: Opt-in live scanned-book acceptance (`test_live_acceptance.py`)**
+  - Skip (with a reason naming what is missing) unless all of these hold: env `TRIBUNAL_LIVE_SCAN_PDF` names a readable PDF; `shutil.which("ocrmypdf")` is found; env `TRIBUNAL_LIVE_RUNTIME_CONFIG` names a runtime config whose roles use a non-stub provider whose credential is set.
+  - Use a temporary SQLite database and local store (never an external database), with `RUNTIME_CONFIG` set to the live config; no OCR override and no provider factory.
+  - Upload the scan through the API, run the worker until idle, assert the document is `ready` and every page's method is `ocr` (no usable text layer), create a 3 x 2 marks short-answer template over the first proposed topics, request a paper, run the worker until idle, assert every slot is `drafted` or `needs_review`, approve them, export the key as JSON.
+  - Write a reviewer sheet (Markdown) to `TRIBUNAL_LIVE_REVIEW_SHEET` (default under the pytest tmp dir): for each question, the question, the answer, and for each citation the page number and the full cited passage text, followed by a line `Reviewer: supports the answer? yes / no`. Print the sheet path.
+
+- [ ] **Step 5: README**
+  - Add "Timers" (the definitions above) and "Pilot acceptance" (CI uses simulated OCR; for acceptance run `test_live_acceptance.py` with the env vars above on a machine with OCRmyPDF/Tesseract and the deployed model; a reviewer opens each cited page via the passage URL and marks the sheet; a citation on the right page can still support a wrong answer, for example when OCR misreads a symbol).
+
+- [ ] **Step 6: Run** `tests/test_acceptance.py -s`, `tests/test_api.py`, `tests/test_live_acceptance.py` (expect a skip with a clear reason), then the full suite, ruff and the text scan.
+
+- [ ] **Step 7: Commit** `test(backend): tighten first-ticket acceptance`
