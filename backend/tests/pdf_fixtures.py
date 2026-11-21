@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 
+import pypdfium2 as pdfium
 from fpdf import FPDF
 from PIL import Image, ImageDraw, ImageFont
 
@@ -29,6 +30,22 @@ def digital_pdf(pages: list[str], bookmarks: list[tuple[str, int]] | None = None
         pdf.set_font("Helvetica", size=12)
         pdf.multi_cell(0, 6, text)
     return bytes(pdf.output())
+
+
+def encrypted_pdf() -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=12)
+    pdf.cell(0, 10, "secret")
+    pdf.set_encryption(owner_password="owner", user_password="user")
+    return bytes(pdf.output())
+
+
+def zero_page_pdf() -> bytes:
+    doc = pdfium.PdfDocument.new()
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 def scanned_pdf(page_count: int) -> bytes:

@@ -49,7 +49,7 @@ def read_pdf(data: bytes, max_pages: int) -> list[PageInfo]:
     doc = _open(data)
     try:
         n = len(doc)
-        if n == 0:
+        if n == 0:  # defensive: pdfium refuses zero-page files in _open
             raise ValidationFailed("PDF has no pages")
         if n > max_pages:
             raise ValidationFailed(f"PDF has {n} pages; the limit is {max_pages}")

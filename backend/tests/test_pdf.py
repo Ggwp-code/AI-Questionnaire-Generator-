@@ -1,5 +1,5 @@
 import pytest
-from pdf_fixtures import digital_pdf, mixed_pdf, scanned_pdf
+from pdf_fixtures import digital_pdf, encrypted_pdf, mixed_pdf, scanned_pdf, zero_page_pdf
 
 from tribunal.errors import ValidationFailed
 from tribunal.ingestion.pdf import page_texts, read_pdf, read_toc
@@ -43,3 +43,16 @@ def test_toc():
 def test_page_texts():
     out = page_texts(digital_pdf(["first page", "second page"]), [2])
     assert set(out) == {2} and "second" in out[2]
+
+
+def test_encrypted_pdf_unreadable():
+    with pytest.raises(ValidationFailed) as e:
+        read_pdf(encrypted_pdf(), 10)
+    assert e.value.message == "file is not a readable PDF"
+
+
+def test_zero_page_pdf_refused_by_pdfium():
+    # pdfium refuses zero-page files at load time, so "PDF has no pages" is only a defensive check
+    with pytest.raises(ValidationFailed) as e:
+        read_pdf(zero_page_pdf(), 10)
+    assert e.value.message == "file is not a readable PDF"
