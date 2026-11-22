@@ -8,7 +8,7 @@ from sqlalchemy import select
 from tribunal.context import build_context
 from tribunal.db.models import Document, Page, Paper, PaperTemplate, Passage, Slot, Topic
 from tribunal.ingestion.ocr import OcrUnavailable
-from tribunal.ingestion.pipeline import extraction_version, ingest_document
+from tribunal.ingestion.pipeline import extraction_version, ingest_document, page_flags
 from tribunal.retrieval.search import retrieve
 from tribunal.runtime_config import ConfigSnapshot
 from tribunal.settings import load_settings, reset_settings_cache
@@ -245,3 +245,85 @@ def test_failed_refresh_keeps_index_searchable_and_reports_error(ctx, monkeypatc
         assert s.get(Document, doc_id).error == "refresh failed"
         job = s.get(Job, job_id)
         assert (job.status, job.error, job.attempts) == ("failed", "refresh failed", 1)
+
+
+FORMULA_PAGE = "Entropy of a node\nH(S) = -Σ p_i log2 p_i\n" + "entropy measures impurity " * 10
+PLAIN_PAGE = "Pruning removes branches that do not help. " * 6
+
+
+def _evidence_pages(ctx, doc_id) -> set[int]:
+    with ctx.session_factory() as s:
+        doc = s.get(Document, doc_id)
+        return {p.page_number for p in s.scalars(select(Passage).where(
+            Passage.document_id == doc_id, Passage.extraction_version == doc.extraction_version))}
+
+
+def test_formula_on_ocr_page_is_not_evidence(ctx, fake_ocr):
+    fake_ocr.texts = {1: FORMULA_PAGE, 2: PLAIN_PAGE}
+    doc_id = _doc(ctx, scanned_pdf(2))
+    doc = _run(ctx, doc_id)
+    assert doc.status == "ready"
+    assert doc.error == "pages kept out of evidence because their text has a formula or table: 1"
+    assert _evidence_pages(ctx, doc_id) == {2}
+    with ctx.session_factory() as s:
+        found = retrieve(s, ctx.embedder(ctx.snapshot), ctx.snapshot.config.retrieval,
+                         subject_id=doc.subject_id, document_ids=[doc_id], query="entropy impurity")
+        assert {p.page_number for p in found.passages} <= {2}
+        assert len(s.scalars(select(Page)).all()) == 2  # the page text stays for inspection
+    ingest_document(ctx, _limited(ctx, flagged_page_policy="include"), doc_id)
+    assert _evidence_pages(ctx, doc_id) == {1, 2}
+
+
+def test_table_on_ocr_page_is_not_evidence(ctx, fake_ocr):
+    table = "Model     Accuracy    Recall\nTree      0.91        0.88\nRandom Forest    0.94    0.90\n"
+    fake_ocr.texts = {1: table + "results of the comparison " * 8, 2: PLAIN_PAGE}
+    doc_id = _doc(ctx, scanned_pdf(2))
+    assert _run(ctx, doc_id).status == "ready"
+    assert _evidence_pages(ctx, doc_id) == {2}
+
+
+def test_formula_on_native_page_kept_when_only_ocr_is_flagged(ctx):
+    doc_id = _doc(ctx, digital_pdf(["Accuracy = correct / total predictions. " * 5]))
+    doc = _run(ctx, doc_id)
+    assert doc.error is None and _evidence_pages(ctx, doc_id) == {1}
+
+
+@pytest.mark.parametrize("text, flags", [
+    ("Trees split data into branches.", set()),
+    ("The ratio is 3:2, and costs fell - sharply.", set()),
+    ("y = mx + c", {"formula"}),
+    ("x² grows faster", {"formula"}),
+    ("√2 is irrational", {"formula"}),
+    ("Name  Age  City\nAnn  30  Pune\nBob  41  Agra", {"table"}),
+    ("Only  one  wide line\nthen prose", set()),
+])
+def test_page_flags(text, flags):
+    assert page_flags(text) == flags
+
+
+def test_extraction_version_changes_with_flag_policy_and_outline(cfg):
+    ing = cfg.ingestion
+    base = extraction_version(cfg, ["eng"], "e")
+    for update in ({"flagged_page_policy": "include"}, {"flag_formulas_on": []},
+                   {"flag_tables_on": ["native", "ocr"]},
+                   {"outline": ing.outline.model_copy(update={"use_headings": False})}):
+        changed = cfg.model_copy(update={"ingestion": ing.model_copy(update=update)})
+        assert extraction_version(changed, ["eng"], "e") != base
+
+
+def test_outline_change_retires_and_restores_topics(ctx):
+    doc_id = _doc(ctx, digital_pdf(["1 Decision Trees\n" + "Trees split data. " * 20,
+                                    "2 Linear Regression\n" + "Lines fit data. " * 20]))
+    _run(ctx, doc_id)
+
+    def current():
+        with ctx.session_factory() as s:
+            return {t.title: t.id for t in s.scalars(select(Topic).where(Topic.retired_at.is_(None)))}
+
+    before = current()
+    assert set(before) == {"1 Decision Trees", "2 Linear Regression"}
+    outline = ctx.snapshot.config.ingestion.outline.model_copy(update={"use_headings": False})
+    ingest_document(ctx, _limited(ctx, outline=outline), doc_id)
+    assert current() == {}
+    _run(ctx, doc_id)
+    assert current() == before

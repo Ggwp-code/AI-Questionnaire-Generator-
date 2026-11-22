@@ -107,6 +107,7 @@ class Topic(Base):
     page_end: Mapped[int | None] = mapped_column(nullable=True)
     source: Mapped[str] = mapped_column(String(20))
     created_at: Mapped[datetime] = _created()
+    retired_at: Mapped[datetime | None] = _opt_time()  # set when a rebuilt outline no longer has it
 
 
 class PaperTemplate(Base):

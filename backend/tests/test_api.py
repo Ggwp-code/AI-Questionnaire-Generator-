@@ -257,3 +257,24 @@ def test_admin_revoked_when_removed_from_admin_emails(client, ctx, monkeypatch):
     monkeypatch.delenv("ADMIN_EMAILS")
     plain = TestClient(create_app(build_context(load_settings(), ocr_override=ctx.ocr_override)))
     assert plain.get(f"/api/subjects/{sid}/documents", headers=h(B)).status_code == 404
+
+
+def test_retired_outline_topic_hidden_and_refused(client, ctx):
+    from tribunal.ingestion.pipeline import ingest_document
+    from tribunal.runtime_config import ConfigSnapshot
+
+    sid = mk_subject(client)
+    did = upload(client, sid, digital_pdf(["1 Decision Trees\n" + "Trees split data. " * 20,
+                                           "2 Linear Regression\n" + "Lines fit data. " * 20])).json()["document"]["id"]
+    jobs(ctx)
+    topics = {t["title"]: t["id"] for t in client.get(f"/api/subjects/{sid}/topics", headers=h(A)).json()}
+    client.patch(f"/api/topics/{topics['2 Linear Regression']}", json={"title": "Regression"}, headers=h(A))
+    cfg = ctx.snapshot.config
+    ing = cfg.ingestion.model_copy(update={"outline": cfg.ingestion.outline.model_copy(update={"use_headings": False})})
+    ingest_document(ctx, ConfigSnapshot(config=cfg.model_copy(update={"ingestion": ing}), content_hash="nh"), did)
+    listed = client.get(f"/api/subjects/{sid}/topics", headers=h(A)).json()
+    assert [t["title"] for t in listed] == ["Regression"]  # a faculty rename survives the rebuild
+    tpl = client.post("/api/templates", json={"name": "t", "spec": SPEC}, headers=h(A)).json()
+    r = client.post("/api/papers", headers=h(A), json={
+        "subject_id": sid, "template_id": tpl["id"], "topic_ids": [topics["1 Decision Trees"]], "title": "P"})
+    assert r.status_code == 422 and r.json()["error"]["message"] == "unknown topic"

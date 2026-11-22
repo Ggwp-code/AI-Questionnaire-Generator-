@@ -74,9 +74,10 @@ def create_paper(body: PaperIn, user: User = Depends(current_user), session: Ses
         raise NotFound("template not found")
     topic_ids = list(dict.fromkeys(body.topic_ids))
     topics = {t.id: t for t in session.scalars(
-        select(Topic).where(Topic.id.in_(topic_ids), Topic.subject_id == body.subject_id))}
+        select(Topic).where(Topic.id.in_(topic_ids), Topic.subject_id == body.subject_id,
+                            Topic.retired_at.is_(None)))}
     if len(topics) != len(topic_ids):
-        raise ValidationFailed("unknown topic", details=["every topic must belong to the subject"])
+        raise ValidationFailed("unknown topic", details=["every topic must be a current topic of the subject"])
     ready = {d.id: d for d in session.scalars(select(Document).where(
         Document.subject_id == body.subject_id, Document.status == "ready").order_by(Document.created_at))}
     if body.document_ids is None:

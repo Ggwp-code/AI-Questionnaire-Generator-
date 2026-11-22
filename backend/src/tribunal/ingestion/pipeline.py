@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from importlib.metadata import version
 
 from sqlalchemy import delete, select
@@ -16,6 +17,18 @@ from tribunal.ingestion.pdf import read_pdf, read_toc
 from tribunal.jobs.queue import ClaimedJob, owned_transaction
 from tribunal.runtime_config import ConfigSnapshot, RuntimeConfig, canonical_hash
 
+FLAG_RULES = 1  # bump when page_flags changes, so documents are extracted again
+_FORMULA = re.compile(r"[=≠≈≤≥±×÷√∑∏∫∂∇∞^²³¹⁰-₟]")
+_CELL_GAP = re.compile(r" {2,}|\t|\|")
+
+
+def page_flags(text: str) -> set[str]:
+    """Kinds of content whose OCR is unreliable enough to keep out of evidence."""
+    # shortcut: symbol and column-gap heuristics, replace with layout-parser regions when one is configured
+    flags = {"formula"} if _FORMULA.search(text) else set()
+    rows = sum(len([c for c in _CELL_GAP.split(line) if c.strip()]) >= 3 for line in text.splitlines())
+    return flags | {"table"} if rows >= 3 else flags
+
 
 def extraction_version(cfg: RuntimeConfig, languages: list[str], embedder_id: str) -> str:
     ing = cfg.ingestion
@@ -26,6 +39,9 @@ def extraction_version(cfg: RuntimeConfig, languages: list[str], embedder_id: st
         "native_min_chars": ing.native_min_chars, "mixed_image_coverage": ing.mixed_image_coverage,
         "chunk_chars": cfg.retrieval.chunk_chars, "chunk_overlap_chars": cfg.retrieval.chunk_overlap_chars,
         "embedder": embedder_id,
+        "flag_rules": FLAG_RULES, "flag_formulas_on": sorted(ing.flag_formulas_on),
+        "flag_tables_on": sorted(ing.flag_tables_on), "flagged_page_policy": ing.flagged_page_policy,
+        "outline": ing.outline.model_dump(mode="json"),
     })[:12]
 
 
@@ -82,8 +98,15 @@ def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, 
         for n in mixed:
             texts[n], methods[n] = texts[n] + "\n" + ocr_text.get(n, ""), "native+ocr"
 
+    flagged_on = {"formula": set(ing.flag_formulas_on), "table": set(ing.flag_tables_on)}
+    excluded = sorted(n for n in texts if ing.flagged_page_policy == "exclude" and any(
+        flagged_on[kind] & set(methods[n].split("+")) for kind in page_flags(texts[n])))
+    notice = (f"pages kept out of evidence because their text has a formula or table: "
+              f"{', '.join(map(str, excluded))}") if excluded else None
+
     embedder = ctx.embedder(snapshot)
-    chunks = chunk_pages(texts, cfg.retrieval.chunk_chars, cfg.retrieval.chunk_overlap_chars)
+    evidence = {n: t for n, t in texts.items() if n not in excluded}
+    chunks = chunk_pages(evidence, cfg.retrieval.chunk_chars, cfg.retrieval.chunk_overlap_chars)
     vectors = embedder.embed([c.text for c in chunks]) if chunks else []
     outline = build_outline(read_toc(data), texts, ing.outline, len(infos))
 
@@ -108,10 +131,12 @@ def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, 
             same = existing.get(e.title.lower())
             if same:
                 topic = same.pop(0)
-                topic.page_start, topic.page_end = e.page_start, e.page_end
+                topic.page_start, topic.page_end, topic.retired_at = e.page_start, e.page_end, None
             else:
                 session.add(Topic(subject_id=subject_id, document_id=document_id, title=e.title,
                                   page_start=e.page_start, page_end=e.page_end, source=e.source))
+        for topic in (t for left in existing.values() for t in left):  # no longer in this outline
+            topic.retired_at = topic.retired_at or utcnow()
         doc = session.get(Document, document_id)
         doc.page_count, doc.extraction_version = len(infos), xv
-        doc.status, doc.ready_at, doc.error = "ready", utcnow(), None
+        doc.status, doc.ready_at, doc.error = "ready", utcnow(), notice

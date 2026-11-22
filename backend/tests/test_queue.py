@@ -252,3 +252,36 @@ def test_terminal_job_and_target_failure_roll_back_together(ctx):
     assert _job_status(ctx, job_id) == ("running", None)
     with ctx.session_factory() as s:
         assert s.get(Document, doc_id).error is None
+
+
+def test_worker_that_lost_its_lease_does_not_mark_document_ready(ctx, fake_ocr, monkeypatch):
+    from pdf_fixtures import scanned_pdf
+
+    ctx.store.put("k", scanned_pdf(1))
+    doc_id = _doc(ctx)
+    (job_id,) = _enqueue(ctx, doc_id)
+    second_busy, release_second = threading.Event(), threading.Event()
+    second = threading.Thread(target=worker.run_once, args=(ctx,))
+
+    def second_ocr(*_args):
+        second_busy.set()
+        assert release_second.wait(5)
+        return {1: "Decision trees classify samples. " * 8}
+
+    def first_ocr(*_args):  # the lease expires and a second worker starts while this OCR runs
+        with ctx.session_factory.begin() as s:
+            s.get(Job, job_id).lease_until = utcnow() - timedelta(seconds=1)
+        monkeypatch.setattr(fake_ocr, "ocr_pages", second_ocr)
+        second.start()
+        assert second_busy.wait(5)
+        return {1: "stale OCR " * 8}
+
+    monkeypatch.setattr(fake_ocr, "ocr_pages", first_ocr)
+    assert worker.run_once(ctx)
+    with ctx.session_factory() as s:
+        assert s.get(Document, doc_id).status == "processing"
+    release_second.set()
+    second.join(5)
+    with ctx.session_factory() as s:
+        assert s.get(Document, doc_id).status == "ready"
+    assert _job_status(ctx, job_id) == ("done", None)

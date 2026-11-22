@@ -91,7 +91,7 @@ def download(did: str, user: User = Depends(current_user), session: Session = DB
 def list_topics(sid: str, user: User = Depends(current_user), session: Session = DB) -> list[dict]:
     require_member(session, sid, user)
     return [_topic_json(t) for t in session.scalars(
-        select(Topic).where(Topic.subject_id == sid).order_by(Topic.created_at, Topic.page_start, Topic.id))]
+        select(Topic).where(Topic.subject_id == sid, Topic.retired_at.is_(None)).order_by(Topic.created_at, Topic.page_start, Topic.id))]
 
 
 @router.post("/subjects/{sid}/topics", status_code=201)
@@ -111,7 +111,8 @@ def rename_topic(tid: str, body: TitleIn, user: User = Depends(current_user),
     if topic is None:
         raise NotFound("topic not found")
     require_member(session, topic.subject_id, user)
-    topic.title = body.title.strip()
+    # A renamed topic is faculty-owned from now on, so an outline rebuild never retires it.
+    topic.title, topic.source = body.title.strip(), "faculty"
     return _topic_json(topic)
 
 
