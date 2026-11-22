@@ -301,7 +301,7 @@ python verify_quality.py
 │   │   └── api.ts              # API client
 │   └── types.ts                # TypeScript types
 └── docs/
-    └── REPORT_*.md             # Project documentation
+    └── department-pilot-roadmap.md  # Production roadmap
 ```
 
 ## Troubleshooting
