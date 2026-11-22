@@ -26,7 +26,7 @@ from tribunal.runtime_config import (
     snapshot_from_json,
 )
 from tribunal.settings import Settings
-from tribunal.storage import LocalStore, make_store
+from tribunal.storage import LocalStore, S3Store, make_store
 from tribunal.textpolicy import TextPolicy
 
 
@@ -35,7 +35,7 @@ class AppContext:
     settings: Settings
     snapshot: ConfigSnapshot
     session_factory: sessionmaker[Session]
-    store: LocalStore
+    store: LocalStore | S3Store
     ocr_override: OcrEngine | None = None
     provider_factory: Callable[[str, ProviderConfig], ModelProvider] | None = None
     _providers: dict[tuple[str, str], ModelProvider] = field(default_factory=dict)

@@ -23,16 +23,20 @@ Required on every profile:
   DATABASE_URL         for example sqlite:///tribunal.db
   RUNTIME_CONFIG       path to the runtime configuration file
   AUTH_MODE            dev or oidc
-  STORAGE_BACKEND      local or s3; s3 is NOT implemented in this build
+  STORAGE_BACKEND      local or s3
   SIGNING_SECRET       at least 32 characters
 
 Also required, by profile:
   STORAGE_LOCAL_ROOT   when STORAGE_BACKEND is local
+  S3_BUCKET_UPLOADS, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY   when STORAGE_BACKEND is s3; this
+                       also needs the s3 extra (pip install -e "backend[s3]")
+  S3_ENDPOINT_URL      set for Cloudflare R2 or another S3-compatible service; omit for AWS
+  S3_REGION            auto for R2
+  S3_BUCKET_EXPORTS    validated but not used yet, because exports are rendered on request
   OIDC_ISSUER, OIDC_AUDIENCE, OIDC_JWKS_URL   when AUTH_MODE is oidc
   Hosted profiles (staging, production): AUTH_MODE oidc, ALLOWED_ORIGINS, an https PUBLIC_BASE_URL,
   a PostgreSQL DATABASE_URL, PDF_FONT_REGULAR and STORAGE_BACKEND s3.
-  Because s3 is not implemented yet, staging and production cannot start in this build; only the
-  local and test profiles run.
+  Staging and production also need Postgres with pgvector, an OIDC provider and the s3 extra.
 
 AUTH_MODE dev trusts an X-Dev-User header and is for local use and tests only.
 
@@ -106,5 +110,5 @@ it only to the reviewer, through the channel used for exam material.
 Not in this build
 -----------------
 
-S3 storage, the Anthropic provider, OpenAI embeddings, contents-page outlines, layout extraction,
+The Anthropic provider, OpenAI embeddings, contents-page outlines, layout extraction,
 progress streaming, legacy import and frontend integration.
