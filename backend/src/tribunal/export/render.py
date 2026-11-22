@@ -20,7 +20,8 @@ __all__ = ["ExportBlocked", "build_export", "render_pdf"]
 
 def build_export(session: Session, paper, part: Literal["paper", "key"], snapshot: ConfigSnapshot,
                  policy: TextPolicy) -> dict:
-    problems = export_problems(session, paper, snapshot.config)
+    revisions = current_revisions(session, paper)  # read once: what is checked is what is exported
+    problems = export_problems(session, paper, snapshot.config, revisions=revisions)
     if problems:
         raise ExportBlocked("Paper cannot be exported", details=problems)
     tpl = session.get(PaperTemplate, paper.template_id)
@@ -30,7 +31,7 @@ def build_export(session: Session, paper, part: Literal["paper", "key"], snapsho
     cite = key and snapshot.config.export.include_citations_in_answer_key
     sections: dict[str, dict] = {}
     approvals = []
-    for slot, rev in current_revisions(session, paper):
+    for slot, rev in revisions:
         c = rev.content
         q = {"number": slot.number, "marks": slot.marks, "question": c["question"], "options": c.get("options")}
         if key:

@@ -218,3 +218,24 @@ def test_failed_refresh_preserves_approved_key(ex, monkeypatch):
     key = export(ctx, pid, "key")
     assert key["sections"] == expected["sections"]
     assert key["approvals"] == expected["approvals"]
+
+
+def test_build_export_reads_revisions_once(ex, monkeypatch):
+    from tribunal.export import checks, render
+
+    ctx, pid, _ = ex
+    approve(ctx, pid)
+    for n, q in ((1, "Why do decision trees overfit noisy data"), (2, "Describe how pruning limits tree depth"),
+                 (3, "Explain least squares fitting of a regression line")):
+        set_content(ctx, pid, n, question=q)
+    calls = []
+    real = checks.current_revisions
+
+    def counting(session, paper):
+        calls.append(1)
+        return real(session, paper)
+
+    monkeypatch.setattr(checks, "current_revisions", counting)
+    monkeypatch.setattr(render, "current_revisions", counting)
+    export(ctx, pid, "key")
+    assert len(calls) == 1

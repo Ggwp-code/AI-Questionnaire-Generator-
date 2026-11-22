@@ -20,11 +20,12 @@ def current_revisions(session: Session, paper) -> list[tuple[Slot, Revision | No
     return [(s, session.get(Revision, s.current_revision_id) if s.current_revision_id else None) for s in slots]
 
 
-def export_problems(session: Session, paper, cfg: RuntimeConfig) -> list[str]:
+def export_problems(session: Session, paper, cfg: RuntimeConfig, *,
+                    revisions: list[tuple[Slot, Revision | None]] | None = None) -> list[str]:
     valid = set(session.scalars(select(Passage.id).where(Passage.document_id.in_(paper.document_ids))))
     problems: list[str] = []
     texts: list[tuple[int, set[str]]] = []
-    for slot, rev in current_revisions(session, paper):
+    for slot, rev in revisions if revisions is not None else current_revisions(session, paper):
         n = slot.number
         if slot.status != "approved" or rev is None or not rev.approved_by:
             problems.append(f"question {n} is not approved")
