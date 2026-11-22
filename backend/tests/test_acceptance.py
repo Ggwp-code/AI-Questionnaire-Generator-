@@ -143,6 +143,11 @@ def test_first_ticket(test_env, settings, fake_ocr, ctx):
     gap_json = json.dumps(gap)
     assert not [i for i in a_ids if i in gap_json]
 
+    # The mirror: A's book has no French Revolution, and "The" in the title must not fake a match.
+    fr = client.post(f"/api/subjects/{sa}/topics", json={"title": "1 The French Revolution"}, headers=h(A)).json()
+    gap_a = get_paper(client, make_paper(client, ctx, sa, A, [fr["id"]]), A)
+    assert [s["status"] for s in gap_a["slots"]] == ["evidence_gap"] * 3
+
     before = [s["revision"]["id"] for s in paper_a["slots"]]
     assert client.post(f"/api/papers/{pa}/slots/2/regenerate", headers=h(A)).status_code == 202
     drain(ctx)

@@ -85,6 +85,7 @@ class RetrievalConfig(_Strict):
     lexical_weight: float = Field(ge=0)
     topic_page_boost: float = Field(ge=0)
     require_term_match: bool
+    min_term_coverage: float = Field(ge=0, le=1)
     source_kinds: list[str]
 
 
@@ -162,6 +163,7 @@ class RetryConfig(_Strict):
     max_delay_seconds: PositiveFloat
     lease_seconds: PositiveInt
     poll_interval_seconds: PositiveFloat
+    job_retry_delay_seconds: float = Field(ge=0)
 
 
 class BudgetConfig(_Strict):

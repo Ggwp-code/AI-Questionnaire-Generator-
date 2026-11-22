@@ -69,6 +69,7 @@ class Document(Base):
     status: Mapped[str] = mapped_column(String(20), default="queued")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     extraction_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    embedder_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = _created()
     ready_at: Mapped[datetime | None] = _opt_time()
 

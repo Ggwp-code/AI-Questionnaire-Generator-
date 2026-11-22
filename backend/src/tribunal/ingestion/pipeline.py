@@ -71,6 +71,7 @@ def ingest_document(ctx: AppContext, snapshot: ConfigSnapshot, document_id: str,
             doc.error = None
             doc.status = "ready" if doc.extraction_version else "processing"
             if xv == doc.extraction_version:
+                doc.embedder_id = ctx.embedder(snapshot).model_id  # the version includes it: backfills 0005
                 return
         _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, owner)
     except TribunalError as exc:
@@ -144,4 +145,5 @@ def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, 
             topic.retired_at = topic.retired_at or utcnow()
         doc = session.get(Document, document_id)
         doc.page_count, doc.extraction_version = len(infos), xv
+        doc.embedder_id = embedder.model_id
         doc.status, doc.ready_at, doc.error = "ready", utcnow(), None

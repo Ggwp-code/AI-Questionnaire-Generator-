@@ -10,7 +10,8 @@ from tribunal.generation.providers.base import ProviderError, ProviderResult
 from tribunal.runtime_config import RetryConfig
 
 RETRY = RetryConfig(
-    max_attempts=3, base_delay_seconds=0.01, max_delay_seconds=1, lease_seconds=60, poll_interval_seconds=1
+    max_attempts=3, base_delay_seconds=0.01, max_delay_seconds=1, lease_seconds=60, poll_interval_seconds=1,
+    job_retry_delay_seconds=0
 )
 OK = ProviderResult("x", "m", 1, 1)
 

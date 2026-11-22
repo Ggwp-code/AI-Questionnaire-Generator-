@@ -32,6 +32,7 @@ retrieval:
   lexical_weight: 0.5
   topic_page_boost: 0.2
   require_term_match: true
+  min_term_coverage: 0.25
   source_kinds: [native, ocr, layout]
 ingestion:
   max_upload_bytes: 20000000
@@ -88,6 +89,7 @@ retries:
   max_delay_seconds: 0.05
   lease_seconds: 900
   poll_interval_seconds: 0.05
+  job_retry_delay_seconds: 0
 budgets:
   paper_tokens: 200000
   reserve_per_call: 4000
