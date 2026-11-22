@@ -46,6 +46,18 @@ configuration, and only new papers use the current one.
 
 AUTH_MODE dev trusts an X-Dev-User header and is for local use and tests only.
 
+Cloudflare Access
+-----------------
+Behind Cloudflare Access, sign in with the JWT that Access adds to each request:
+  AUTH_MODE=oidc
+  AUTH_JWT_HEADER=Cf-Access-Jwt-Assertion   the header holds the bare JWT (no "Bearer " prefix); the
+                       default, Authorization, still expects "Bearer <jwt>"
+  OIDC_ISSUER          the team domain, https://<team>.cloudflareaccess.com
+  OIDC_AUDIENCE        the application's AUD tag
+  OIDC_JWKS_URL        https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+  OIDC_REQUIRE_EMAIL_VERIFIED=false   Access tokens carry email but no email_verified claim
+                       (https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/application-token/)
+
 Runtime configuration
 ---------------------
 

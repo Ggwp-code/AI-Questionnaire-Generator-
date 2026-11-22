@@ -326,7 +326,7 @@ def test_reprocess_refused_while_queued_and_for_non_members(client, ctx):
     assert client.post("/api/documents/nope/reprocess", headers=h(A)).status_code == 404
 
 
-def _oidc_client(ctx, monkeypatch, *, require_verified=True):
+def _oidc_client(ctx, monkeypatch, *, require_verified=True, header="Authorization"):
     import time
 
     import jwt
@@ -335,7 +335,8 @@ def _oidc_client(ctx, monkeypatch, *, require_verified=True):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     ctx.settings = ctx.settings.model_copy(update={
         "auth_mode": "oidc", "oidc_issuer": "https://idp.example", "oidc_audience": "tribunal",
-        "oidc_jwks_url": "https://idp.example/jwks", "oidc_require_email_verified": require_verified})
+        "oidc_jwks_url": "https://idp.example/jwks", "oidc_require_email_verified": require_verified,
+        "auth_jwt_header": header})
     app = create_app(ctx)
     app.state.jwks_client = type("K", (), {"get_signing_key_from_jwt": lambda self, t: type(
         "S", (), {"key": key.public_key()})()})()
@@ -347,7 +348,11 @@ def _oidc_client(ctx, monkeypatch, *, require_verified=True):
         for k in [k for k, v in claims.items() if v is None]:
             base.pop(k)
         token = jwt.encode(base, key, algorithm="RS256")
-        return TestClient(app).get("/api/me", headers={"Authorization": f"Bearer {token}"})
+        value = f"Bearer {token}" if header == "Authorization" else token
+        return TestClient(app).get("/api/me", headers={header: value})
+    call.app, call.sign = app, lambda: jwt.encode(
+        {"iss": "https://idp.example", "aud": "tribunal", "exp": int(time.time()) + 600, "email": "o@example.com"},
+        key, algorithm="RS256")
     return call
 
 
@@ -418,3 +423,45 @@ def test_edit_may_not_cite_a_superseded_extraction(client, ctx, paper):
     assert refused.status_code == 422
     kept = client.put(url, headers=h(A), json={"content": dict(first["content"], answer="Edited answer")})
     assert kept.status_code == 200
+
+
+def test_oidc_reads_configured_header(ctx, monkeypatch):
+    call = _oidc_client(ctx, monkeypatch, require_verified=False, header="Cf-Access-Jwt-Assertion")
+    assert call().status_code == 200
+    r = TestClient(call.app).get("/api/me", headers={"Authorization": f"Bearer {call.sign()}"})
+    assert r.status_code == 401
+
+
+def test_subject_papers_listed_newest_first_and_scoped(client, ctx, paper, ready):
+    sid, _ = ready
+    tpl = client.post("/api/templates", json={"name": "t", "spec": SPEC}, headers=h(A)).json()["id"]
+    tid = client.get(f"/api/subjects/{sid}/topics", headers=h(A)).json()[0]["id"]
+    second = client.post("/api/papers", headers=h(A), json={
+        "subject_id": sid, "template_id": tpl, "topic_ids": [tid], "title": "Second"}).json()["paper_id"]
+    rows = client.get(f"/api/subjects/{sid}/papers", headers=h(A)).json()
+    assert [r["id"] for r in rows] == [second, paper]
+    assert set(rows[0]) == {"id", "title", "status", "created_at", "template"}
+    assert rows[0]["template"] == {"name": "t", "version": 2}
+    assert client.get(f"/api/subjects/{sid}/papers", headers=h(B)).status_code == 404
+
+
+def test_options_lists_configured_values(client, ctx):
+    cfg = ctx.snapshot.config
+    r = client.get("/api/options", headers=h(A))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["question_types"] == [{"key": k, "label": v.label}
+                                      for k, v in cfg.generation.question_types.items() if v.enabled]
+    assert body["bloom_levels"] == [{"key": b.key, "label": b.label} for b in cfg.generation.bloom_levels]
+    assert body["difficulty_levels"] == [{"key": d.key, "label": d.label} for d in cfg.generation.difficulty_levels]
+    assert body["default_ocr_languages"] == cfg.ingestion.ocr.languages
+    assert client.get("/api/options").status_code == 401
+
+
+def test_options_omits_disabled_question_types(client, ctx):
+    cfg = ctx.snapshot.config
+    off, *rest = cfg.generation.question_types
+    qts = cfg.generation.question_types
+    qts[off] = qts[off].model_copy(update={"enabled": False})
+    keys = [q["key"] for q in client.get("/api/options", headers=h(A)).json()["question_types"]]
+    assert off not in keys and keys == rest

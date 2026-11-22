@@ -14,9 +14,14 @@ from tribunal.errors import Unauthorized
 
 def _email_from_token(request: Request, ctx: AppContext) -> str:
     s = ctx.settings
-    header = request.headers.get("Authorization", "")
-    scheme, _, token = header.partition(" ")
-    if scheme.lower() != "bearer" or not token:
+    value = request.headers.get(s.auth_jwt_header, "")
+    if s.auth_jwt_header.lower() == "authorization":
+        scheme, _, token = value.partition(" ")
+        if scheme.lower() != "bearer":
+            token = ""
+    else:  # an edge proxy such as Cloudflare Access sends the bare JWT in its own header
+        token = value.strip()
+    if not token:
         raise Unauthorized("sign in required")
     client = getattr(request.app.state, "jwks_client", None)
     if client is None:  # one client keeps the key cache

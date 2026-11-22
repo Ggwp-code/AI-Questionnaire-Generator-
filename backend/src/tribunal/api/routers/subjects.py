@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from tribunal.api.auth import get_or_create_user
 from tribunal.api.deps import DB, current_user, get_ctx, require_member
 from tribunal.context import AppContext
-from tribunal.db.models import Subject, SubjectMember, User
+from tribunal.db.models import Paper, PaperTemplate, Subject, SubjectMember, User
 from tribunal.errors import Forbidden
 
 router = APIRouter(prefix="/api")
@@ -58,3 +58,24 @@ def add_member(sid: str, body: MemberIn, user: User = Depends(current_user), ses
     if session.get(SubjectMember, (sid, member.id)) is None:
         session.add(SubjectMember(subject_id=subject.id, user_id=member.id, role="member"))
     return {"subject_id": sid, "email": member.email}
+
+
+@router.get("/subjects/{sid}/papers")
+def list_papers(sid: str, user: User = Depends(current_user), session: Session = DB) -> list[dict]:
+    require_member(session, sid, user)
+    rows = session.execute(
+        select(Paper, PaperTemplate).join(PaperTemplate, PaperTemplate.id == Paper.template_id)
+        .where(Paper.subject_id == sid).order_by(Paper.created_at.desc(), Paper.id.desc()))
+    return [{"id": p.id, "title": p.title, "status": p.status, "created_at": p.created_at,
+             "template": {"name": t.name, "version": t.version}} for p, t in rows]
+
+
+@router.get("/options")
+def options(_: User = Depends(current_user), ctx: AppContext = Depends(get_ctx)) -> dict:
+    cfg = ctx.snapshot.config
+    return {
+        "question_types": [{"key": k, "label": v.label} for k, v in cfg.generation.question_types.items() if v.enabled],
+        "bloom_levels": [{"key": b.key, "label": b.label} for b in cfg.generation.bloom_levels],
+        "difficulty_levels": [{"key": d.key, "label": d.label} for d in cfg.generation.difficulty_levels],
+        "default_ocr_languages": cfg.ingestion.ocr.languages,
+    }
