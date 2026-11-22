@@ -285,3 +285,12 @@ def test_worker_that_lost_its_lease_does_not_mark_document_ready(ctx, fake_ocr, 
     with ctx.session_factory() as s:
         assert s.get(Document, doc_id).status == "ready"
     assert _job_status(ctx, job_id) == ("done", None)
+
+
+def test_requeued_job_waits_out_its_retry_delay(ctx):
+    (a,) = _enqueue(ctx, "a")
+    first = claim_next(ctx.session_factory, 60)
+    assert fail_job(ctx.session_factory, a, first.attempts, "boom", 3, retry_delay_seconds=30) is True
+    assert claim_next(ctx.session_factory, 60) is None
+    assert claim_next(ctx.session_factory, 60, now=utcnow() + timedelta(seconds=29)) is None
+    assert claim_next(ctx.session_factory, 60, now=utcnow() + timedelta(seconds=31)).id == a

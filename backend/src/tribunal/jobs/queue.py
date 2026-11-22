@@ -33,7 +33,9 @@ def enqueue(session: Session, kind: str, target_id: str, snapshot_id: str) -> Jo
 def claim_next(factory: sessionmaker[Session], lease_seconds: int, now: datetime | None = None) -> ClaimedJob | None:
     now = now or utcnow()
     with factory.begin() as session:
-        eligible = or_(Job.status == "queued", (Job.status == "running") & (Job.lease_until < now))
+        # a requeued job waits out its retry delay, which is kept in lease_until
+        ready = or_(Job.lease_until.is_(None), Job.lease_until <= now)
+        eligible = or_((Job.status == "queued") & ready, (Job.status == "running") & (Job.lease_until < now))
         candidate = (select(Job.id).where(eligible).order_by(Job.created_at, Job.id)
                      .limit(1).with_for_update(skip_locked=True).scalar_subquery())
         job = session.scalar(update(Job).where(Job.id == candidate, eligible)
@@ -85,10 +87,12 @@ def finish_job(factory: sessionmaker[Session], job_id: str, attempts: int) -> bo
 
 
 def fail_job(factory: sessionmaker[Session], job_id: str, attempts: int, error: str,
-             max_attempts: int, on_terminal: Callable[[Session], None] | None = None) -> bool | None:
+             max_attempts: int, on_terminal: Callable[[Session], None] | None = None,
+             retry_delay_seconds: float = 0) -> bool | None:
     """True: queued for another attempt. False: failed for good. None: the caller no longer owns it."""
     retry = attempts < max_attempts
-    values = {"status": "queued", "lease_until": None} if retry else {"status": "failed", "finished_at": utcnow()}
+    delay = utcnow() + timedelta(seconds=retry_delay_seconds * attempts)
+    values = {"status": "queued", "lease_until": delay} if retry else {"status": "failed", "finished_at": utcnow()}
     with factory.begin() as session:
         owned = session.execute(_owned(job_id, attempts).values(error=error, **values)).rowcount == 1
         if owned:

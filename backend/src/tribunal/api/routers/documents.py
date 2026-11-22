@@ -73,6 +73,20 @@ def upload(sid: str, file: UploadFile = File(...), languages: str | None = Form(
     return {"document": _doc_json(doc), "job_id": job.id}
 
 
+@router.post("/documents/{did}/reprocess", status_code=202)
+def reprocess(did: str, user: User = Depends(current_user), session: Session = DB,
+              ctx: AppContext = Depends(get_ctx)) -> dict:
+    doc = session.get(Document, did)
+    if doc is None:
+        raise NotFound("document not found")
+    require_member(session, doc.subject_id, user)
+    if doc.status in ("queued", "processing"):
+        raise Conflict("document is already being processed")
+    doc.status = "queued"
+    job = enqueue(session, "ingest", doc.id, ctx.snapshot.snapshot_id)
+    return {"document": _doc_json(doc), "job_id": job.id}
+
+
 @router.get("/subjects/{sid}/documents")
 def list_documents(sid: str, user: User = Depends(current_user), session: Session = DB) -> list[dict]:
     require_member(session, sid, user)

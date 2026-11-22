@@ -117,7 +117,8 @@ def run_once(ctx: AppContext) -> bool:
         hook = FINAL_FAILURE.get(job.kind)
         error = str(exc)
         requeued = fail_job(ctx.session_factory, job.id, job.attempts, error, max_attempts,
-                            lambda session: hook(session, job, error) if hook else None)
+                            lambda session: hook(session, job, error) if hook else None,
+                            retries.job_retry_delay_seconds)
         owned = requeued is not None
     else:
         owned = finish_job(ctx.session_factory, job.id, job.attempts)
