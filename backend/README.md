@@ -7,9 +7,10 @@ them through faculty approval. This package is the backend service and its comma
 Install
 -------
 
-    pip install -e "backend[dev]"
+    pip install -e "backend[dev,openai,s3]"
 
-Optional extras: ocr (ocrmypdf), openai, postgres (psycopg and pgvector), embeddings-local
+The test suite needs the dev, openai and s3 extras (the tests import openai and botocore).
+Other optional extras: ocr (ocrmypdf), postgres (psycopg and pgvector), embeddings-local
 (sentence-transformers). Python 3.12 or newer.
 
 Environment variables
@@ -70,6 +71,7 @@ Commands
 Tests
 -----
 
+    pip install -e "backend[dev,openai,s3]"
     cd backend && pytest
     ruff check backend
 
