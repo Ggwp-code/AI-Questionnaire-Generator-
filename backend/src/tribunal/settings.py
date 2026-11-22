@@ -125,7 +125,7 @@ class Settings(BaseSettings):
     def secret_values(self) -> list[str]:
         """Plain secret values, used only by the log redaction filter."""
         values: list[str] = []
-        for name in ("signing_secret", "internal_dispatch_token", "s3_access_key_id", "s3_secret_access_key", "cf_api_token"):
+        for name in ("signing_secret", "internal_dispatch_token", "s3_access_key_id", "s3_secret_access_key", "cf_api_token", "verifier_token"):
             secret = getattr(self, name)
             if secret is not None and secret.get_secret_value():
                 values.append(secret.get_secret_value())
@@ -151,8 +151,9 @@ def consistency_problems(s: Settings) -> list[str]:
             problems.append("PDF_FONT_REGULAR is required on hosted profiles")
         if s.verifier_mode != "service":
             problems.append("VERIFIER_MODE must be 'service' on hosted profiles")
-        elif not s.verifier_url:
-            problems.append("VERIFIER_URL is required on hosted profiles")
+
+    if s.verifier_mode == "service" and not s.verifier_url:
+        problems.append("VERIFIER_URL is required when VERIFIER_MODE is 'service'")
 
     if "*" in s.allowed_origins:
         problems.append("ALLOWED_ORIGINS must list explicit origins; '*' is not accepted")

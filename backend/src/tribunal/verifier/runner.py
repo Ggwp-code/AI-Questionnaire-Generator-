@@ -13,9 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
@@ -41,6 +39,7 @@ class RunResult:
 
 def _apply_limits(limits: Limits):
     def apply() -> None:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_seconds, limits.cpu_seconds))
         mem = limits.memory_mb * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
@@ -62,46 +61,52 @@ def run_program(program: str, limits: Limits, python: str = sys.executable) -> R
     try:
         with open(os.path.join(workdir, "program.py"), "w", encoding="utf-8") as f:
             f.write(program)
-        proc = subprocess.Popen(
-            [python, "-I", "program.py"],
-            cwd=workdir,
-            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": workdir},
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            preexec_fn=_apply_limits(limits),  # noqa: PLW1509 - limits must be set in the child
-        )
-        tail: deque[bytes] = deque()
-
-        def drain_stderr() -> None:
-            size = 0
-            for chunk in iter(lambda: proc.stderr.read(4096), b""):
-                tail.append(chunk)
-                size += len(chunk)
-                while size - len(tail[0]) >= STDERR_TAIL_BYTES:
-                    size -= len(tail.popleft())
-
-        reader = threading.Thread(target=drain_stderr, daemon=True)
-        reader.start()
+        try:
+            proc = subprocess.Popen(
+                [python, "-I", "program.py"],
+                cwd=workdir,
+                # Thread pinning for numeric libraries, not secrets.
+                env={
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": workdir,
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "OMP_NUM_THREADS": "1",
+                    "MKL_NUM_THREADS": "1",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                preexec_fn=_apply_limits(limits),  # noqa: PLW1509 - limits must be set in the child
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            return RunResult("error", None, f"could not start program: {type(exc).__name__}: {exc}"[:STDERR_TAIL_BYTES])
         out = bytearray()
+        err = b""
         status: str | None = None
+        out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+        open_fds = {out_fd, err_fd}
         deadline = time.monotonic() + limits.wall_seconds
         try:
-            fd = proc.stdout.fileno()
-            while True:
+            while open_fds:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     status = "timeout"
                     break
-                if not select.select([fd], [], [], left)[0]:
-                    continue
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                out += chunk
-                if len(out) > limits.max_output_bytes:
-                    status = "too_large"
+                ready = select.select(list(open_fds), [], [], min(left, 0.2))[0]
+                if not ready and proc.poll() is not None:
+                    break  # exited; whatever still holds the pipes is not ours to wait for
+                for fd in ready:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        open_fds.discard(fd)
+                    elif fd == out_fd:
+                        out += chunk
+                        if len(out) > limits.max_output_bytes:
+                            status = "too_large"
+                    else:
+                        err = (err + chunk)[-STDERR_TAIL_BYTES:]
+                if status:
                     break
             if status is None:
                 try:
@@ -109,12 +114,12 @@ def run_program(program: str, limits: Limits, python: str = sys.executable) -> R
                 except subprocess.TimeoutExpired:
                     status = "timeout"
         finally:
+            # Close without waiting for EOF: an escaped grandchild may still hold the pipes.
             _kill_group(proc)
-            proc.wait()
             proc.stdout.close()
-            reader.join(timeout=1)
             proc.stderr.close()
-        stderr_tail = b"".join(tail).decode("utf-8", "replace")[-STDERR_TAIL_BYTES:]
+            proc.wait()
+        stderr_tail = err.decode("utf-8", "replace")
         if status is None:
             status = "ok" if proc.returncode == 0 else "error"
         lines = out.decode("utf-8", "replace").splitlines()

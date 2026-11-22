@@ -87,3 +87,28 @@ def test_older_short_answer_snapshot_without_codegen_loads(snapshot):
     restored = snapshot_from_json(content).config
     assert restored.question_type_keys() == ["short_answer"]
     assert restored.generation.question_types["short_answer"].writer_role == "writer"
+
+
+def test_snapshot_without_verifier_section_loads(snapshot):
+    from tribunal.runtime_config import snapshot_from_json
+
+    content = snapshot.as_json()
+    content.pop("verifier")
+    assert snapshot_from_json(content).config.verifier is None
+
+
+def test_runtime_file_without_verifier_is_a_problem(tmp_path, test_env):
+    import pytest
+    import yaml
+
+    from tribunal.errors import ConfigurationError
+    from tribunal.runtime_config import load_runtime_config
+
+    raw = yaml.safe_load(test_env["runtime"].read_text())
+    raw.pop("verifier")
+    p = tmp_path / "r.yaml"
+    raw["prompts"] = {k: {"file": str(test_env["runtime"].parent / v["file"])} for k, v in raw["prompts"].items()}
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigurationError) as exc:
+        load_runtime_config(p)
+    assert any("verifier" in x for x in exc.value.problems)

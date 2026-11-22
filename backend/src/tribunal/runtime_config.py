@@ -215,7 +215,8 @@ class RuntimeConfig(_Strict):
     text_policy: TextPolicyConfig
     export: ExportConfig
     observability: ObservabilityConfig
-    verifier: VerifierConfig
+    # Optional so stored snapshots from before this section existed still load; the runtime file must have it.
+    verifier: VerifierConfig | None = None
 
     @model_validator(mode="after")
     def _references(self) -> RuntimeConfig:
@@ -338,6 +339,8 @@ def load_runtime_config(path: str | Path) -> ConfigSnapshot:
             prompts[key] = ref
     resolved["prompts"] = prompts
 
+    if resolved.get("verifier") is None:
+        missing.append("verifier: Field required")
     if missing:
         raise ConfigurationError(missing)
     try:

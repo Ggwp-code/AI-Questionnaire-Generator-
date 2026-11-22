@@ -56,4 +56,14 @@ def test_hosted_profile_requires_service_mode(test_env, monkeypatch):
     assert any("VERIFIER_MODE" in p for p in problems)
     monkeypatch.setenv("VERIFIER_MODE", "service")
     problems = problems_of()
-    assert not any("VERIFIER_MODE" in p for p in problems) and any("VERIFIER_URL" in p for p in problems)
+    assert not any("must be 'service'" in p for p in problems) and any("VERIFIER_URL" in p for p in problems)
+
+
+def test_service_mode_needs_url_on_every_profile(test_env, monkeypatch):
+    monkeypatch.setenv("VERIFIER_MODE", "service")
+    assert "VERIFIER_URL is required when VERIFIER_MODE is 'service'" in problems_of()
+
+
+def test_verifier_token_is_redacted(test_env, monkeypatch):
+    monkeypatch.setenv("VERIFIER_TOKEN", "verifier-token-value")
+    assert "verifier-token-value" in load_settings().secret_values()

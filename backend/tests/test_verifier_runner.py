@@ -15,13 +15,10 @@ def test_program_result_last_line():
     assert r.status == "ok" and json.loads(r.last_line) == {"answer": 42}
 
 
-def test_environment_is_empty(monkeypatch):
+def test_parent_secret_is_not_inherited(monkeypatch):
     monkeypatch.setenv("VERIFIER_TEST_SECRET", "hunter2")
     r = run_program("import os, json\nprint(json.dumps(sorted(os.environ)))\n", LIMITS)
-    names = json.loads(r.last_line)
-    # The interpreter itself may add LC_CTYPE when it coerces the C locale.
-    assert r.status == "ok" and {"HOME", "PATH"} <= set(names) <= {"HOME", "PATH", "LC_CTYPE"}
-    assert "VERIFIER_TEST_SECRET" not in names
+    assert r.status == "ok" and "VERIFIER_TEST_SECRET" not in json.loads(r.last_line)
 
 
 def test_cpu_loop_is_stopped():
@@ -88,3 +85,90 @@ def test_http_verifier_posts_program_and_token():
     r = HttpVerifier("http://v/", SecretStr("tok"), LIMITS, client=c).run("p")
     assert r.status == "ok" and seen["auth"] == "Bearer tok" and seen["url"] == "http://v/run"
     assert seen["body"]["program"] == "p" and seen["body"]["limits"]["cpu_seconds"] == 2
+
+
+def test_escaped_child_does_not_hold_the_runner():
+    prog = (
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    time.sleep(60)\n"
+        "    os._exit(0)\n"
+        "time.sleep(60)\n"
+    )
+    limits = Limits(cpu_seconds=2, wall_seconds=2, memory_mb=256, max_processes=4096, max_file_bytes=65536, max_output_bytes=4096)
+    t = time.monotonic()
+    r = run_program(prog, limits)
+    assert r.status == "timeout" and time.monotonic() - t < limits.wall_seconds + 2
+
+
+def _http(handler, url="http://v"):
+    return HttpVerifier(url, None, LIMITS, client=httpx.Client(transport=httpx.MockTransport(handler))).run("p")
+
+
+def test_http_verifier_never_raises_and_validates_bodies():
+    bad = [
+        httpx.Response(200, json={"status": "weird", "last_line": None, "stderr_tail": ""}),
+        httpx.Response(200, content=b"not json"),
+        httpx.Response(200, json={"status": "ok", "last_line": 5, "stderr_tail": ""}),
+        httpx.Response(200, json={"status": "ok", "last_line": None, "stderr_tail": 7}),
+        httpx.Response(200, json=["ok"]),
+    ]
+    for resp in bad:
+        r = _http(lambda req, resp=resp: resp)
+        assert r.status == "error" and r.stderr_tail == "verifier service unavailable: malformed response", resp
+    assert _http(lambda req: httpx.Response(200), url="not a url").status == "error"
+    assert _http(lambda req: httpx.Response(200), url="http://[bad").status == "error"
+
+
+def _example_limits():
+    from pathlib import Path
+
+    import yaml
+
+    cfg = yaml.safe_load((Path(__file__).parents[1] / "config" / "runtime.example.yaml").read_text())
+    return Limits(**cfg["verifier"])
+
+
+def test_numpy_imports_under_example_limits():
+    r = run_program("import numpy\nprint('{\"v\": \"%s\"}' % numpy.__version__)\n", _example_limits())
+    assert r.status == "ok", r.stderr_tail
+
+
+def test_sympy_imports_under_example_limits():
+    import pytest
+
+    pytest.importorskip("sympy")
+    r = run_program("import sympy\nprint('{}')\n", _example_limits())
+    assert r.status == "ok", r.stderr_tail
+
+
+def test_child_environment_only_has_thread_pinning():
+    r = run_program("import os, json\nprint(json.dumps(dict(os.environ)))\n", LIMITS)
+    env = json.loads(r.last_line)
+    assert {k for k in env if k not in ("PATH", "HOME", "LC_CTYPE")} == {
+        "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"}
+    assert env["OMP_NUM_THREADS"] == "1"
+
+
+def test_setrlimit_failure_is_an_error_result():
+    hard = resource_hard_nproc()
+    bad = Limits(2, 4, 256, hard + 1000, 65536, 4096) if hard is not None else None
+    if bad is None:
+        import pytest
+
+        pytest.skip("no finite hard NPROC")
+    r = run_program("print('{}')\n", bad)
+    assert r.status == "error" and r.last_line is None and r.stderr_tail
+
+
+def resource_hard_nproc():
+    import resource
+
+    h = resource.getrlimit(resource.RLIMIT_NPROC)[1]
+    return None if h == resource.RLIM_INFINITY else h
+
+
+def test_core_dumps_are_disabled():
+    r = run_program("import resource\nprint(resource.getrlimit(resource.RLIMIT_CORE)[0])\n", LIMITS)
+    assert r.last_line == "0"

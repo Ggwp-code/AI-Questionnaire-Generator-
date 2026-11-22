@@ -41,9 +41,19 @@ class HttpVerifier:
             )
             if not resp.is_success:
                 return _unavailable(str(resp.status_code))
-            body = resp.json()
-            return RunResult(body["status"], body.get("last_line"), body.get("stderr_tail", ""))
-        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            try:
+                body = resp.json()
+            except ValueError:
+                return _unavailable("malformed response")
+            if (
+                not isinstance(body, dict)
+                or body.get("status") not in ("ok", "error", "timeout", "too_large")
+                or not isinstance(body.get("last_line"), (str, type(None)))
+                or not isinstance(body.get("stderr_tail"), str)
+            ):
+                return _unavailable("malformed response")
+            return RunResult(body["status"], body["last_line"], body["stderr_tail"])
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
             return _unavailable(type(exc).__name__)
 
 

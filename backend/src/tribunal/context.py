@@ -100,10 +100,12 @@ def build_context(
     with factory.begin() as session:
         if session.get(ConfigSnapshotRow, snapshot.snapshot_id) is None:
             session.add(ConfigSnapshotRow(id=snapshot.snapshot_id, content=snapshot.as_json()))
+    if snapshot.config.verifier is None:
+        raise ConfigurationError(["verifier: Field required"])
     limits = Limits(**snapshot.config.verifier.model_dump())
     verifier: VerifierClient = (
-        HttpVerifier(settings.verifier_url, settings.verifier_token, limits)
-        if settings.verifier_mode == "service" and settings.verifier_url
+        HttpVerifier(settings.verifier_url or "", settings.verifier_token, limits)
+        if settings.verifier_mode == "service"
         else SubprocessVerifier(limits)
     )
     return AppContext(settings, snapshot, factory, make_store(settings), ocr_override, provider_factory, verifier)
