@@ -162,6 +162,7 @@ class Slot(Base):
     difficulty: Mapped[str] = mapped_column(String(50))
     topic_id: Mapped[str | None] = _fk("topics.id", nullable=True)
     topic_title: Mapped[str] = mapped_column(String(500))
+    parts: Mapped[list | None] = mapped_column(JsonType, nullable=True)  # marks per part
     status: Mapped[str] = mapped_column(String(20), default="pending")
     status_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     current_revision_id: Mapped[str | None] = mapped_column(String(32), nullable=True)  # no FK: cycle

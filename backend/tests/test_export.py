@@ -239,3 +239,21 @@ def test_build_export_reads_revisions_once(ex, monkeypatch):
     monkeypatch.setattr(render, "current_revisions", counting)
     export(ctx, pid, "key")
     assert len(calls) == 1
+
+
+def test_export_renders_parts(ex):
+    ctx, pid, _ = ex
+    parts = [{"label": "a", "question": "First part?", "answer": "Ans one", "citations": [],
+              "rubric": [{"criterion": "crit one", "marks": 1}]},
+             {"label": "b", "question": "Second part?", "answer": "Ans two", "citations": [],
+              "rubric": [{"criterion": "crit two", "marks": 1}]}]
+    set_content(ctx, pid, 1, parts=parts)
+    approve(ctx, pid)
+    q = export(ctx, pid, "paper")["sections"][0]["questions"][0]
+    assert [p["question"] for p in q["parts"]] == ["First part?", "Second part?"]
+    assert all("answer" not in p and "rubric" not in p for p in q["parts"])
+    k = export(ctx, pid, "key")["sections"][0]["questions"][0]
+    assert [p["answer"] for p in k["parts"]] == ["Ans one", "Ans two"]
+    assert k["parts"][1]["rubric"] == [{"criterion": "crit two", "marks": 1}]
+    cfg = ctx.snapshot.config.export
+    assert render_pdf(export(ctx, pid, "key"), font_regular=None, font_bold=None, fallbacks=[], cfg=cfg)

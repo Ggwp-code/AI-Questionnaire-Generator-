@@ -34,6 +34,9 @@ def build_export(session: Session, paper, part: Literal["paper", "key"], snapsho
     for slot, rev in revisions:
         c = rev.content
         q = {"number": slot.number, "marks": slot.marks, "question": c["question"], "options": c.get("options")}
+        if c.get("parts"):
+            q["parts"] = [{k: v for k, v in pt.items() if key or k in ("label", "question", "options")}
+                          for pt in c["parts"]]
         if key:
             q["answer"] = c["answer"]
             q["rubric"] = c.get("rubric", [])
@@ -108,8 +111,16 @@ def render_pdf(doc: dict, *, font_regular: Path | None, font_bold: Path | None, 
             line(f"{q['number']}. {q['question']} [{q['marks']:g}]")
             for i, opt in enumerate(q["options"] or []):
                 line(f"    {chr(65 + i)}. {opt}")
+            for pt in q.get("parts", []):
+                line(f"    ({pt['label']}) {pt['question']}")
+                for i, opt in enumerate(pt.get("options") or []):
+                    line(f"        {chr(65 + i)}. {opt}")
             if "answer" in q:
                 line("Answer: " + q["answer"], "B")
+                for pt in q.get("parts", []):
+                    line(f"    ({pt['label']}) {pt['answer']}", "B")
+                    for r in pt.get("rubric", []):
+                        line(f"        - {r['criterion']} ({r['marks']:g})")
                 for r in q["rubric"]:
                     line(f"    - {r['criterion']} ({r['marks']:g})")
                 for c in q.get("citations", []):

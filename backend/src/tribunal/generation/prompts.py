@@ -27,6 +27,7 @@ def slot_block(slot: Slot, cfg: RuntimeConfig) -> str:
     g = cfg.generation
     bloom = {lv.key: lv.label for lv in g.bloom_levels}.get(slot.bloom, slot.bloom)
     diff = {lv.key: lv.label for lv in g.difficulty_levels}.get(slot.difficulty, slot.difficulty)
+    parts = [f"Parts: {len(slot.parts)}, with marks " + ", ".join(str(m) for m in slot.parts)] if slot.parts else []
     return "\n".join(
         [
             f"Question number: {slot.number}",
@@ -35,6 +36,7 @@ def slot_block(slot: Slot, cfg: RuntimeConfig) -> str:
             f"Bloom level: {bloom}",
             f"Difficulty: {diff}",
             f"Topic: {slot.topic_title}",
+            *parts,
         ]
     )
 

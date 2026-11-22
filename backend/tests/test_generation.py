@@ -439,7 +439,7 @@ def _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, tokens):
 
 def test_call_larger_than_remaining_budget_is_refused_before_the_provider(
         test_env, monkeypatch, fake_ocr, fake_holder):
-    ctx = _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, 3000)  # the writer bound is about 3300
+    ctx = _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, 3000)  # the writer bound is about 3700
     pid = make_paper(ctx)[0]
     for s in go(ctx, pid):
         assert s.status == "failed" and "budget" in s.status_detail
@@ -457,7 +457,7 @@ def test_tokens_used_never_exceeds_the_paper_budget(test_env, monkeypatch, fake_
 
 
 def test_call_that_fits_the_remaining_budget_is_allowed(test_env, monkeypatch, fake_ocr, fake_holder):
-    ctx = _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, 3500)  # below the old flat reserve of 4000
+    ctx = _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, 3800)  # below the old flat reserve of 4000
     pid = make_paper(ctx, n=1, topics=("Decision trees",))[0]
     (slot,) = go(ctx, pid)
     assert slot.status == "drafted"

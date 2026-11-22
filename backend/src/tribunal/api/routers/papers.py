@@ -101,7 +101,7 @@ def create_paper(body: PaperIn, user: User = Depends(current_user), session: Ses
     for sp in specs:
         session.add(Slot(paper_id=paper.id, number=sp.number, section=sp.section, question_type=sp.question_type,
                          marks=sp.marks, bloom=sp.bloom, difficulty=sp.difficulty, topic_id=sp.topic_id,
-                         topic_title=topics[sp.topic_id].title))
+                         topic_title=topics[sp.topic_id].title, parts=sp.parts))
     job = enqueue(session, "generate_paper", paper.id, ctx.snapshot.snapshot_id)
     return {"paper_id": paper.id, "job_id": job.id}
 
@@ -200,7 +200,8 @@ def edit_slot(pid: str, n: int, body: EditIn, user: User = Depends(current_user)
     allowed |= set(current.content.get("citations", [])) if current else set()
     problems = check_draft(
         draft, marks=slot.marks, question_type=slot.question_type, passage_ids=allowed,
-        placeholder_patterns=g.placeholder_patterns, mcq_option_count=g.mcq_option_count)
+        placeholder_patterns=g.placeholder_patterns, mcq_option_count=g.mcq_option_count,
+        parts=slot.parts)
     if problems:
         raise ValidationFailed("Draft is invalid", details=problems)
     number = (session.scalar(select(func.max(Revision.number)).where(Revision.slot_id == slot.id)) or 0) + 1

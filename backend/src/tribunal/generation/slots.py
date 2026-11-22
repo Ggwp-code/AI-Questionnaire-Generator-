@@ -157,7 +157,8 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
             rev_id = rev.id
             s.get(Slot, slot_id).current_revision_id = rev_id
         problems = check_draft(draft, marks=slot.marks, question_type=slot.question_type, passage_ids=passage_ids,
-                               placeholder_patterns=g.placeholder_patterns, mcq_option_count=g.mcq_option_count)
+                               placeholder_patterns=g.placeholder_patterns, mcq_option_count=g.mcq_option_count,
+                               parts=slot.parts)
         if problems:
             continue
         content = draft.model_dump()

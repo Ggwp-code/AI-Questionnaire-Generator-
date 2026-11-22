@@ -47,3 +47,12 @@ def test_answer_any_exceeds_count(cfg):
 def test_unknown_field_rejected():
     with pytest.raises(ValidationFailed):
         parse_template_spec({**SPEC, "colour": "red"})
+
+
+def test_parts_must_sum_to_marks(cfg):
+    ok = expand_blueprint(parse_template_spec({"sections": [{**SEC, "parts": [1, 1]}], "total_marks": 6}), ["t"], cfg)
+    assert all(s.parts == [1, 1] for s in ok)
+    assert expand_blueprint(parse_template_spec(SPEC), ["t"], cfg)[0].parts is None
+    with pytest.raises(ValidationFailed) as ei:
+        expand_blueprint(parse_template_spec({"sections": [{**SEC, "parts": [1, 2]}], "total_marks": 6}), ["t"], cfg)
+    assert "sections[0].parts sum to 3, expected marks_each 2" in ei.value.details

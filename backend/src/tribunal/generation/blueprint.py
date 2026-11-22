@@ -16,6 +16,7 @@ class TemplateSection(BaseModel, extra="forbid"):
     bloom: str
     difficulty: str
     answer_any: PositiveInt | None = None
+    parts: list[PositiveInt] | None = None  # marks per part
 
 
 class TemplateSpec(BaseModel, extra="forbid"):
@@ -33,6 +34,7 @@ class SlotSpec:
     bloom: str
     difficulty: str
     topic_id: str
+    parts: list[int] | None = None
 
 
 def parse_template_spec(data: dict) -> TemplateSpec:
@@ -59,6 +61,8 @@ def expand_blueprint(spec: TemplateSpec, topic_ids: list[str], cfg: RuntimeConfi
             problems.append(f"sections[{i}].difficulty '{s.difficulty}' is not a configured difficulty level")
         if s.answer_any is not None and s.answer_any > s.count:
             problems.append(f"sections[{i}].answer_any {s.answer_any} exceeds count {s.count}")
+        if s.parts is not None and sum(s.parts) != s.marks_each:
+            problems.append(f"sections[{i}].parts sum to {sum(s.parts)}, expected marks_each {s.marks_each}")
         total += s.marks_each * (s.answer_any or s.count)
     if total != spec.total_marks:
         problems.append(f"total_marks is {spec.total_marks} but the sections add up to {total}")
@@ -72,5 +76,5 @@ def expand_blueprint(spec: TemplateSpec, topic_ids: list[str], cfg: RuntimeConfi
         for _ in range(s.count):
             n = len(slots)
             slots.append(SlotSpec(n + 1, s.title, s.question_type, s.marks_each, s.bloom, s.difficulty,
-                                  topic_ids[n % len(topic_ids)]))
+                                  topic_ids[n % len(topic_ids)], s.parts))
     return slots

@@ -3,6 +3,7 @@ import pytest
 from tribunal.generation.draft import (
     Draft,
     DraftInvalid,
+    DraftPart,
     Review,
     RubricItem,
     check_draft,
@@ -115,3 +116,40 @@ def test_computational_answer_is_one_plain_number(question_type):
     assert _check(draft, question_type="trace") == []
     draft.answer = "3e1"
     assert _check(draft, question_type=question_type) == []
+
+
+def _part(label, marks, **kw):
+    return DraftPart(label=label, question=f"Q{label}", answer="A", rubric=[RubricItem(criterion="x", marks=marks)],
+                     citations=["p1"], **kw)
+
+
+def test_draft_parts_checked():
+    d = Draft(question="Stem", answer="", parts=[_part("a", 1), _part("b", 1)])
+    assert _check(d, parts=[1, 1]) == []
+    assert _check(d, parts=[1, 1, 0]) == ["expected 3 parts, got 2"]
+    d.parts[1].rubric = [RubricItem(criterion="x", marks=2)]
+    d.parts[0].answer = " "
+    d.parts[0].citations = ["zz"]
+    assert _check(d, parts=[1, 1]) == [
+        "part a answer is blank",
+        "citation 'zz' is not one of the supplied passages",
+        "part b rubric totals 2, expected 1",
+    ]
+
+
+def test_draft_mcq_parts_checked():
+    good = _part("a", 1, options=["1", "2", "3", "4"], correct_option=1)
+    good.answer = "2"
+    bad = _part("b", 1, options=["1", "1", "3", "4"], correct_option=7)
+    d = Draft(question="Stem", answer="", parts=[good, bad])
+    assert _check(d, parts=[1, 1], question_type="mcq") == [
+        "part b: options must be distinct",
+        "part b: correct_option is missing or out of range",
+    ]
+
+
+def test_draft_without_parts_unchanged():
+    d = Draft(question="Q", answer="A", rubric=[RubricItem(criterion="x", marks=2)], citations=["p1"])
+    assert _check(d) == _check(d, parts=None) == []
+    assert _check(Draft(question="Q", answer="", parts=[_part("a", 2)])) == [
+        "answer is blank", "rubric is empty", "no citations"]
