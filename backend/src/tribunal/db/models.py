@@ -181,6 +181,7 @@ class Revision(Base):
     retrieval_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     input_tokens: Mapped[int] = mapped_column(default=0)
     output_tokens: Mapped[int] = mapped_column(default=0)
+    job_id: Mapped[str | None] = mapped_column(String(32), nullable=True)  # the job that wrote it
     created_by: Mapped[str | None] = _fk("users.id", nullable=True)
     approved_by: Mapped[str | None] = _fk("users.id", nullable=True)
     approved_at: Mapped[datetime | None] = _opt_time()

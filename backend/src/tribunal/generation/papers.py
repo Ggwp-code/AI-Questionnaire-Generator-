@@ -8,7 +8,7 @@ from datetime import timedelta
 from sqlalchemy import select
 
 from tribunal.context import AppContext
-from tribunal.db.models import Paper, Slot
+from tribunal.db.models import Paper, Revision, Slot
 from tribunal.db.types import utcnow
 from tribunal.generation.slots import _finish, generate_slot
 from tribunal.jobs.queue import ClaimedJob, OwnershipLost, owned_transaction
@@ -50,6 +50,8 @@ def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str, *, owner
 
 def regenerate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str, *, owner: ClaimedJob | None = None) -> None:
     with owned_transaction(ctx.session_factory, owner) as s:
+        if owner and s.scalar(select(Revision.id).where(Revision.slot_id == slot_id, Revision.job_id == owner.id)):
+            return  # redelivered after this job saved its result: leave the slot (and any approval) alone
         slot = s.get(Slot, slot_id)
         slot.status, slot.status_detail = "pending", None
     generate_slot(ctx, snapshot, slot_id, owner=owner)

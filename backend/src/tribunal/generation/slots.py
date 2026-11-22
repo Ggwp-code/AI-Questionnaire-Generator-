@@ -59,22 +59,24 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
         if utcnow() > deadline:
             raise _Stop("paper deadline exceeded")
         provider, role = ctx.provider(snapshot, role_name)
+        # shortcut: the bound assumes at least one byte per token, true of byte-level tokenizers
+        reserve = len((system + user).encode("utf-8")) + role.max_output_tokens
         with owned_transaction(ctx.session_factory, owner) as s:
-            reserve_tokens(s, paper_id, budgets.reserve_per_call, budgets.paper_tokens)
+            reserve_tokens(s, paper_id, reserve, budgets.paper_tokens)
             if owner:
-                s.get(Job, owner.id).reserved_tokens += budgets.reserve_per_call
+                s.get(Job, owner.id).reserved_tokens += reserve
         try:
             res = call_with_retries(lambda: provider.complete(role, system, user), cfg.retries)
         except BaseException:
             with owned_transaction(ctx.session_factory, owner) as s:
-                settle_tokens(s, paper_id, -budgets.reserve_per_call)
+                settle_tokens(s, paper_id, -reserve)
                 if owner:
-                    s.get(Job, owner.id).reserved_tokens -= budgets.reserve_per_call
+                    s.get(Job, owner.id).reserved_tokens -= reserve
             raise
         with owned_transaction(ctx.session_factory, owner) as s:
-            settle_tokens(s, paper_id, res.input_tokens + res.output_tokens - budgets.reserve_per_call)
+            settle_tokens(s, paper_id, res.input_tokens + res.output_tokens - reserve)
             if owner:
-                s.get(Job, owner.id).reserved_tokens -= budgets.reserve_per_call
+                s.get(Job, owner.id).reserved_tokens -= reserve
         return res, role.model
 
     if utcnow() > deadline:
@@ -118,6 +120,7 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
             nxt = (s.scalar(select(func.max(Revision.number)).where(Revision.slot_id == slot_id)) or 0) + 1
             rev = Revision(slot_id=slot_id, number=nxt, author="model", content=draft.model_dump(), model=model,
                            prompt_version=f"{wt.id}@{wt.version}", retrieval_version=found.version,
+                           job_id=owner.id if owner else None,
                            input_tokens=res.input_tokens, output_tokens=res.output_tokens)
             s.add(rev)
             s.flush()

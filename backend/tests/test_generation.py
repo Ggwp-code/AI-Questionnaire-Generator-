@@ -329,7 +329,7 @@ def test_reclaimed_generation_preserves_winning_result(settings, fake_ocr, fake_
     def paused_writer(user):
         with ctx.session_factory.begin() as s:
             job = s.get(Job, jid)
-            assert job.reserved_tokens == ctx.snapshot.config.budgets.reserve_per_call
+            assert job.reserved_tokens > 0 and job.reserved_tokens == s.get(Paper, pid).tokens_used
             job.lease_until = utcnow() - timedelta(seconds=1)
         fake_holder["fake"].writer = None
         assert run_once(ctx)
@@ -343,4 +343,64 @@ def test_reclaimed_generation_preserves_winning_result(settings, fake_ocr, fake_
     assert [result()] == winner
     slot, paper, job, used, reserved, _, _, count = winner[0]
     assert (slot, paper, job, reserved, count) == ("drafted", "drafted", "done", 0, 1)
-    assert 0 < used < ctx.snapshot.config.budgets.reserve_per_call
+    assert 0 < used < ctx.snapshot.config.budgets.paper_tokens  # settled to real usage
+
+
+def test_replayed_regeneration_job_keeps_the_saved_result_and_the_approval(gen):
+    from tribunal.jobs.queue import claim_next
+
+    ctx, pid, _ = gen
+    go(ctx, pid)
+    slot = slots(ctx, pid)[1]
+    with ctx.session_factory.begin() as s:
+        jid = enqueue(s, "regenerate_slot", slot.id, ctx.snapshot.snapshot_id).id
+    job = claim_next(ctx.session_factory, 60)
+    assert job.id == jid
+    regenerate(ctx, ctx.snapshot, slot.id, owner=job)  # saves its revision, then the worker dies
+    saved = slots(ctx, pid)[1]
+    with ctx.session_factory.begin() as s:  # faculty approve the saved revision meanwhile
+        rev = s.get(Revision, saved.current_revision_id)
+        rev.approved_by, rev.approved_at = s.get(Paper, pid).created_by, utcnow()
+        s.get(Slot, slot.id).status = "approved"
+    count = len(revs(ctx, slot.id))
+    regenerate(ctx, ctx.snapshot, slot.id, owner=job)  # the reclaimed job replays
+    after = slots(ctx, pid)[1]
+    assert (after.status, after.current_revision_id) == ("approved", saved.current_revision_id)
+    assert len(revs(ctx, slot.id)) == count
+
+
+def _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, tokens):
+    src = test_env["runtime"]
+    text = re.sub(r"file: \.\./\.\./config", f"file: {src.parent.parent.parent}/config", src.read_text())
+    new = test_env["tmp"] / "runtime.yaml"
+    new.write_text(text.replace("paper_tokens: 200000", f"paper_tokens: {tokens}"))
+    monkeypatch.setenv("RUNTIME_CONFIG", str(new))
+    reset_settings_cache()
+    from tribunal.settings import load_settings
+    return make_ctx(load_settings(), fake_ocr, fake_holder)
+
+
+def test_call_larger_than_remaining_budget_is_refused_before_the_provider(
+        test_env, monkeypatch, fake_ocr, fake_holder):
+    ctx = _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, 3000)  # the writer bound is about 3300
+    pid = make_paper(ctx)[0]
+    for s in go(ctx, pid):
+        assert s.status == "failed" and "budget" in s.status_detail
+    assert fake_holder["fake"].prompts == []
+    with ctx.session_factory() as s:
+        assert s.get(Paper, pid).tokens_used == 0
+
+
+def test_tokens_used_never_exceeds_the_paper_budget(test_env, monkeypatch, fake_ocr, fake_holder):
+    ctx = _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, 9000)
+    pid = make_paper(ctx)[0]
+    go(ctx, pid)
+    with ctx.session_factory() as s:
+        assert 0 < s.get(Paper, pid).tokens_used <= 9000
+
+
+def test_call_that_fits_the_remaining_budget_is_allowed(test_env, monkeypatch, fake_ocr, fake_holder):
+    ctx = _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, 3500)  # below the old flat reserve of 4000
+    pid = make_paper(ctx, n=1, topics=("Decision trees",))[0]
+    (slot,) = go(ctx, pid)
+    assert slot.status == "drafted"

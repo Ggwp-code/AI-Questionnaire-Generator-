@@ -168,7 +168,6 @@ class RetryConfig(_Strict):
 
 class BudgetConfig(_Strict):
     paper_tokens: PositiveInt
-    reserve_per_call: PositiveInt
     paper_deadline_seconds: PositiveInt
     daily_tokens: PositiveInt | None = None
 

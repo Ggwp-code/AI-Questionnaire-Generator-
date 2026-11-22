@@ -92,7 +92,6 @@ retries:
   job_retry_delay_seconds: 0
 budgets:
   paper_tokens: 200000
-  reserve_per_call: 4000
   paper_deadline_seconds: 600
 events: {poll_interval_seconds: 1.0, heartbeat_seconds: 15.0}
 text_policy:
