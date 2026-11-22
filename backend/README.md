@@ -125,7 +125,7 @@ progress streaming, legacy import and frontend integration.
 Both images are `linux/amd64`, built from the repository root, and run `tribunal serve` as a non-root user on port 8080 (`HOST=0.0.0.0`, `PORT=8080`).
 
 - `deploy/api.Dockerfile`: the API and generation jobs. Includes the DejaVu Sans fonts and sets `PDF_FONT_REGULAR` and `PDF_FONT_BOLD` to them.
-- `deploy/ingest.Dockerfile`: ingestion jobs with OCR (`ocrmypdf`, `tesseract-ocr`). Build argument `TESSERACT_LANGS` (default `"eng hin"`) lists one `tesseract-ocr-<lang>` package per entry.
+- `deploy/ingest.Dockerfile`: ingestion jobs with OCR (`ocrmypdf`, `tesseract-ocr`) and the same DejaVu Sans fonts and `PDF_FONT_*` variables as the API image (hosted profiles require them). Build argument `TESSERACT_LANGS` (default `"eng hin"`) lists one `tesseract-ocr-<lang>` package per entry.
 
 ```
 docker build --platform linux/amd64 -f deploy/api.Dockerfile -t tribunal-api .

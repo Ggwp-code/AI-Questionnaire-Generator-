@@ -29,3 +29,5 @@ jobs:
       - run: docker run --rm tribunal-ingest ocrmypdf --version
       - run: docker run --rm tribunal-ingest tesseract --list-langs | tee langs.txt
       - run: grep -qx eng langs.txt && grep -qx hin langs.txt
+      - run: docker run --rm tribunal-ingest test -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+      - run: docker run --rm tribunal-ingest test -f /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf

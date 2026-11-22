@@ -5,7 +5,7 @@ FROM python:3.12-slim
 
 ARG TESSERACT_LANGS="eng hin"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ocrmypdf tesseract-ocr \
+    && apt-get install -y --no-install-recommends ocrmypdf tesseract-ocr fonts-dejavu-core \
         $(for l in $TESSERACT_LANGS; do echo "tesseract-ocr-$l"; done) \
     && rm -rf /var/lib/apt/lists/*
 
@@ -18,7 +18,10 @@ RUN pip install --no-cache-dir "/src/backend[s3,postgres]" \
 
 WORKDIR /app
 # APP_PROFILE, DATABASE_URL, secrets and RUNTIME_CONFIG are supplied at start.
-ENV HOST=0.0.0.0 PORT=8080
+ENV HOST=0.0.0.0 \
+    PORT=8080 \
+    PDF_FONT_REGULAR=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+    PDF_FONT_BOLD=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
 USER tribunal
 EXPOSE 8080
 CMD ["tribunal", "serve"]
