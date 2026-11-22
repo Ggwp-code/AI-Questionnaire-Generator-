@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     cf_queue_ingestion_id: str | None = None
     cf_queue_generation_id: str | None = None
 
+    # Verifier for model-written programs: a separate service, or a local subprocess for development only
+    verifier_mode: Literal["service", "subprocess"] = "subprocess"
+    verifier_url: str | None = None
+    verifier_token: SecretStr | None = None
+
     # Exports
     pdf_font_regular: Path | None = None
     pdf_font_bold: Path | None = None
@@ -144,6 +149,10 @@ def consistency_problems(s: Settings) -> list[str]:
             problems.append("DATABASE_URL must point to PostgreSQL on hosted profiles")
         if not s.pdf_font_regular:
             problems.append("PDF_FONT_REGULAR is required on hosted profiles")
+        if s.verifier_mode != "service":
+            problems.append("VERIFIER_MODE must be 'service' on hosted profiles")
+        elif not s.verifier_url:
+            problems.append("VERIFIER_URL is required on hosted profiles")
 
     if "*" in s.allowed_origins:
         problems.append("ALLOWED_ORIGINS must list explicit origins; '*' is not accepted")

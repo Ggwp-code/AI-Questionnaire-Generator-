@@ -28,6 +28,8 @@ from tribunal.runtime_config import (
 from tribunal.settings import Settings
 from tribunal.storage import LocalStore, S3Store, make_store
 from tribunal.textpolicy import TextPolicy
+from tribunal.verifier.client import HttpVerifier, SubprocessVerifier, VerifierClient
+from tribunal.verifier.runner import Limits
 
 
 @dataclass
@@ -38,6 +40,7 @@ class AppContext:
     store: LocalStore | S3Store
     ocr_override: OcrEngine | None = None
     provider_factory: Callable[[str, ProviderConfig], ModelProvider] | None = None
+    verifier: VerifierClient | None = None
     _providers: dict[tuple[str, str], ModelProvider] = field(default_factory=dict)
     _snapshots: dict[str, ConfigSnapshot] = field(default_factory=dict)
     _embedders: dict[str, Embedder] = field(default_factory=dict)
@@ -97,4 +100,10 @@ def build_context(
     with factory.begin() as session:
         if session.get(ConfigSnapshotRow, snapshot.snapshot_id) is None:
             session.add(ConfigSnapshotRow(id=snapshot.snapshot_id, content=snapshot.as_json()))
-    return AppContext(settings, snapshot, factory, make_store(settings), ocr_override, provider_factory)
+    limits = Limits(**snapshot.config.verifier.model_dump())
+    verifier: VerifierClient = (
+        HttpVerifier(settings.verifier_url, settings.verifier_token, limits)
+        if settings.verifier_mode == "service" and settings.verifier_url
+        else SubprocessVerifier(limits)
+    )
+    return AppContext(settings, snapshot, factory, make_store(settings), ocr_override, provider_factory, verifier)

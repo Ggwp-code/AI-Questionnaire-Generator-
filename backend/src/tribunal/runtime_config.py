@@ -191,6 +191,15 @@ class ObservabilityConfig(_Strict):
     include_paper_text_in_logs: bool
 
 
+class VerifierConfig(_Strict):
+    cpu_seconds: int = Field(gt=0)
+    wall_seconds: int = Field(gt=0)
+    memory_mb: int = Field(gt=0)
+    max_processes: int = Field(gt=0)
+    max_file_bytes: int = Field(gt=0)
+    max_output_bytes: int = Field(gt=0)
+
+
 class RuntimeConfig(_Strict):
     version: str
     providers: dict[str, ProviderConfig]
@@ -206,6 +215,7 @@ class RuntimeConfig(_Strict):
     text_policy: TextPolicyConfig
     export: ExportConfig
     observability: ObservabilityConfig
+    verifier: VerifierConfig
 
     @model_validator(mode="after")
     def _references(self) -> RuntimeConfig:

@@ -47,3 +47,13 @@ def test_redacting_filter_hides_secret():
     record = logging.LogRecord("t", logging.INFO, __file__, 1, "key=supersecretvalue", None, None)
     RedactingFilter(["supersecretvalue"]).filter(record)
     assert record.getMessage() == "key=[redacted]"
+
+
+def test_hosted_profile_requires_service_mode(test_env, monkeypatch):
+    monkeypatch.setenv("APP_PROFILE", "staging")
+    monkeypatch.setenv("VERIFIER_MODE", "subprocess")
+    problems = problems_of()
+    assert any("VERIFIER_MODE" in p for p in problems)
+    monkeypatch.setenv("VERIFIER_MODE", "service")
+    problems = problems_of()
+    assert not any("VERIFIER_MODE" in p for p in problems) and any("VERIFIER_URL" in p for p in problems)

@@ -38,6 +38,7 @@ anthropic = ["anthropic>=0.40"]
 ocr = ["ocrmypdf>=16"]
 layout = ["docling>=2"]
 embeddings-local = ["sentence-transformers>=3"]
+verifier = ["sympy>=1.12"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]

@@ -109,3 +109,4 @@ text_policy:
   preserve_codepoints: ["0023", "002A", "0030-0039", "00A9", "00AE", "2122", "2139", "2194-2199", "21A9-21AA", "27A1", "2934-2935", "2B05-2B07", "2640", "2642", "2660", "2663", "2665", "2666"]
 export: {pdf_font_size: 11, pdf_margin_mm: 18, include_citations_in_answer_key: true}
 observability: {include_paper_text_in_logs: false}
+verifier: {cpu_seconds: 10, wall_seconds: 20, memory_mb: 512, max_processes: 16, max_file_bytes: 1048576, max_output_bytes: 65536}
