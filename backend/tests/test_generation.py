@@ -204,7 +204,14 @@ def test_disputed_review_escalates(gen, reasoner, expected):
     ctx, pid, h = gen
     h["fake"].reviewer = verdict("revise")
     h["fake"].reasoner = verdict(reasoner)
-    assert {s.status for s in go(ctx, pid)} == {expected}
+    done = go(ctx, pid)
+    assert {s.status for s in done} == {expected}
+    for slot in done:
+        review = revs(ctx, slot.id)[-1].review
+        assert review["disputed"] == {"verdict": "revise", "reasons": ["because"], "model": review["disputed"]["model"]}
+        assert review["verdict"] == reasoner
+        detail = "the reasoner overruled the reviewer: because" if reasoner == "pass" else "because"
+        assert slot.status_detail == detail
 
 
 def test_budget_exhausted(test_env, monkeypatch, fake_ocr, fake_holder):

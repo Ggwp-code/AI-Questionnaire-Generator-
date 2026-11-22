@@ -35,6 +35,8 @@ Also required, by profile:
   S3_REGION            auto for R2
   S3_BUCKET_EXPORTS    validated but not used yet, because exports are rendered on request
   OIDC_ISSUER, OIDC_AUDIENCE, OIDC_JWKS_URL   when AUTH_MODE is oidc
+  OIDC_REQUIRE_EMAIL_VERIFIED   true by default: a token whose email_verified claim is not true is
+                       refused; set false only for a provider that does not send the claim
   Hosted profiles (staging, production): AUTH_MODE oidc, ALLOWED_ORIGINS, an https PUBLIC_BASE_URL,
   a PostgreSQL DATABASE_URL, PDF_FONT_REGULAR and STORAGE_BACKEND s3.
   Staging and production also need Postgres with pgvector, an OIDC provider and the s3 extra.

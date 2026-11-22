@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from pdf_fixtures import digital_pdf
 
 from tribunal.api.app import create_app
-from tribunal.db.models import Page, Passage, Slot
+from tribunal.db.models import Document, Page, Passage, Slot
 from tribunal.jobs.worker import run_once
 
 PAGES = ["Decision trees split data into branches. " * 5, "Linear regression fits lines to data. " * 5]
@@ -289,3 +289,71 @@ def test_documents_list_reports_excluded_pages(client, ctx, fake_ocr):
     jobs(ctx)
     [d] = client.get(f"/api/subjects/{sid}/documents", headers=h(A)).json()
     assert d["status"] == "ready" and d["error"] is None and d["excluded_pages"] == [2]
+
+
+def test_reprocess_reingests_a_failed_document(client, ctx):
+    sid = mk_subject(client)
+    did = upload(client, sid, b"%PDF-not really a pdf").json()["document"]["id"]
+    jobs(ctx)
+    [d] = client.get(f"/api/subjects/{sid}/documents", headers=h(A)).json()
+    assert d["status"] == "failed"
+    with ctx.session_factory() as s:
+        key = s.get(Document, did).storage_key
+    ctx.store.put(key, digital_pdf(PAGES))  # the file was replaced or the fault cleared
+    r = client.post(f"/api/documents/{did}/reprocess", headers=h(A))
+    assert r.status_code == 202 and r.json()["document"]["status"] == "queued" and r.json()["job_id"]
+    jobs(ctx)
+    [d] = client.get(f"/api/subjects/{sid}/documents", headers=h(A)).json()
+    assert d["status"] == "ready" and d["error"] is None
+
+
+def test_reprocess_refused_while_queued_and_for_non_members(client, ctx):
+    sid = mk_subject(client)
+    did = upload(client, sid).json()["document"]["id"]
+    r = client.post(f"/api/documents/{did}/reprocess", headers=h(A))
+    assert r.status_code == 409 and r.json()["error"]["message"] == "document is already being processed"
+    jobs(ctx)
+    assert client.post(f"/api/documents/{did}/reprocess", headers=h(B)).status_code == 404
+    assert client.post("/api/documents/nope/reprocess", headers=h(A)).status_code == 404
+
+
+def _oidc_client(ctx, monkeypatch, *, require_verified=True):
+    import time
+
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ctx.settings = ctx.settings.model_copy(update={
+        "auth_mode": "oidc", "oidc_issuer": "https://idp.example", "oidc_audience": "tribunal",
+        "oidc_jwks_url": "https://idp.example/jwks", "oidc_require_email_verified": require_verified})
+    app = create_app(ctx)
+    app.state.jwks_client = type("K", (), {"get_signing_key_from_jwt": lambda self, t: type(
+        "S", (), {"key": key.public_key()})()})()
+
+    def call(**claims):
+        base = {"iss": "https://idp.example", "aud": "tribunal", "exp": int(time.time()) + 600,
+                "email": "o@example.com", "email_verified": True}
+        base.update({k: v for k, v in claims.items() if v is not None})
+        for k in [k for k, v in claims.items() if v is None]:
+            base.pop(k)
+        token = jwt.encode(base, key, algorithm="RS256")
+        return TestClient(app).get("/api/me", headers={"Authorization": f"Bearer {token}"})
+    return call
+
+
+def test_oidc_token_without_exp_is_refused(ctx, monkeypatch):
+    call = _oidc_client(ctx, monkeypatch)
+    assert call().status_code == 200
+    assert call(exp=None).status_code == 401
+
+
+@pytest.mark.parametrize("claim", [False, None, "true"])
+def test_oidc_unverified_email_is_refused(ctx, monkeypatch, claim):
+    r = _oidc_client(ctx, monkeypatch)(email_verified=claim)
+    assert r.status_code == 401 and r.json()["error"]["message"] == "email is not verified"
+
+
+@pytest.mark.parametrize("claim", [False, None])
+def test_oidc_unverified_email_accepted_when_not_required(ctx, monkeypatch, claim):
+    assert _oidc_client(ctx, monkeypatch, require_verified=False)(email_verified=claim).status_code == 200

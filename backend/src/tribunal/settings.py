@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     oidc_issuer: str | None = None
     oidc_audience: str | None = None
     oidc_jwks_url: str | None = None
+    oidc_require_email_verified: bool = True
     auth_jwt_header: str = "Authorization"
     admin_emails: CsvList = Field(default_factory=list)
 

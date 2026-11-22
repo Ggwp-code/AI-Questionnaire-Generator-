@@ -24,9 +24,12 @@ def _email_from_token(request: Request, ctx: AppContext) -> str:
     try:
         key = client.get_signing_key_from_jwt(token)
         claims = jwt.decode(token, key.key, algorithms=["RS256", "ES256"], audience=s.oidc_audience,
-                            issuer=s.oidc_issuer)
+                            issuer=s.oidc_issuer,
+                            options={"require": ["exp", "iss", "aud"]})
     except jwt.PyJWTError:
         raise Unauthorized("invalid token") from None
+    if s.oidc_require_email_verified and claims.get("email_verified") is not True:
+        raise Unauthorized("email is not verified")
     email = claims.get("email")
     if not isinstance(email, str) or not email:
         raise Unauthorized("token has no email claim")

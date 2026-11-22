@@ -80,8 +80,9 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
     if utcnow() > deadline:
         raise _Stop("paper deadline exceeded")
     with ctx.session_factory() as s:
-        rows = searchable_passages(s, subject_id, doc_ids)
-    found = rank_passages(rows, ctx.embedder(snapshot), cfg.retrieval, slot.topic_title, topic)
+        embedder = ctx.embedder(snapshot)
+        rows, stale = searchable_passages(s, subject_id, doc_ids, embedder.model_id)
+    found = rank_passages(rows, embedder, cfg.retrieval, slot.topic_title, topic, stale)
     if found.gap:
         return "evidence_gap", found.gap
 
@@ -129,10 +130,10 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
         if not g.reviewer_enabled:
             return "drafted", None
 
-        def save(review: Review, rmodel: str, rev_id: str = rev_id) -> None:
+        def save(review: Review, rmodel: str, rev_id: str = rev_id, disputed: dict | None = None) -> None:
             with owned_transaction(ctx.session_factory, owner) as s:
                 s.get(Revision, rev_id).review = {"verdict": review.verdict, "reasons": review.reasons,
-                                                  "model": rmodel}
+                                                  "model": rmodel, **({"disputed": disputed} if disputed else {})}
 
         content = draft.model_dump()
         review, rmodel = review_draft("reviewer", content)
@@ -147,6 +148,8 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
         if not g.escalate_disputed_reviews:
             return "needs_review", "; ".join(review.reasons) or None
         final, fmodel = review_draft("reasoner", content)
-        save(final, fmodel)
-        return ("drafted", None) if final.verdict == "pass" else ("needs_review", "; ".join(final.reasons) or None)
+        save(final, fmodel, disputed={"verdict": review.verdict, "reasons": review.reasons, "model": rmodel})
+        if final.verdict == "pass":
+            return "drafted", "the reasoner overruled the reviewer: " + "; ".join(review.reasons)
+        return "needs_review", "; ".join(final.reasons) or None
     return "failed", "; ".join(problems)
