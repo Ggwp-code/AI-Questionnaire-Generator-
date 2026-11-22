@@ -10,6 +10,10 @@
 
 **Spec:** `docs/department-pilot-roadmap.md` (the faculty flow: "A faculty member creates or joins a subject, uploads books, and sees a proposed chapter/topic outline"; "Let instructors open the cited passage, edit, reject, regenerate a single slot or approve it"; "Return real errors throughout the UI").
 
+**Design direction (no Mobbin):** keep the app's existing look (Tailwind as loaded in `index.html`, its accent colours and fonts); a top bar with the signed-in user, a subject header with tabs, tables for documents, cards for questions, and a side panel for passages; plain components, no new UI library.
+
+**Branch:** `feat/faculty-frontend` from `feat/question-pipeline`, which already has question parts. Task 8 waits for the pipeline's stage history route.
+
 **Not in this plan:** progress streaming (pages poll), topic merge, syllabus upload, previous-year papers, deleting the legacy modules, replacing the Tailwind CDN script.
 
 ## Global Constraints
@@ -37,14 +41,14 @@
 ### Task 1: Backend support for the faculty UI
 
 **Files:**
-- Modify: `backend/src/tribunal/api/auth.py`, `backend/src/tribunal/api/routers/papers.py`, `backend/src/tribunal/api/routers/subjects.py`, `backend/README.md`, `docs/staging-runbook.md`
+- Modify: `backend/src/tribunal/api/auth.py`, `backend/src/tribunal/api/routers/papers.py`, `backend/src/tribunal/api/routers/subjects.py`, `backend/README.md`
 - Test: `backend/tests/test_api.py`
 
 **Interfaces:**
 - Edge sign-in: in `oidc` mode `authenticate` reads the header named by `settings.auth_jwt_header`. When it is `Authorization`, the value must be `Bearer <jwt>` (today's behavior); for any other header name (for example `Cf-Access-Jwt-Assertion`), the whole value is the JWT. Verification is unchanged (issuer, audience, keys URL, required `exp`, `iss`, `aud`, and the `email_verified` rule).
 - `GET /api/subjects/{sid}/papers` (member only, else 404): `[{"id", "title", "status", "created_at", "template": {"name", "version"}}]`, newest first.
 - `GET /api/options`: from the API's current snapshot, `{"question_types": [{"key", "label"}], "bloom_levels": [{"key", "label"}], "difficulty_levels": [{"key", "label"}], "default_ocr_languages": [...]}`; only enabled question types.
-- Docs: in `backend/README.md` and `docs/staging-runbook.md`, a "Cloudflare Access" subsection: `AUTH_JWT_HEADER=Cf-Access-Jwt-Assertion`, `OIDC_ISSUER` the team domain, `OIDC_AUDIENCE` the application AUD tag, `OIDC_JWKS_URL` the team's `/cdn-cgi/access/certs` URL, and the right `OIDC_REQUIRE_EMAIL_VERIFIED` value. Confirm the Access token claims (whether `email_verified` is present) against Cloudflare's current Access JWT documentation and cite the page in the report.
+- Docs: in `backend/README.md` (the staging runbook gets the same subsection in the staging-readiness plan's Task 7), a "Cloudflare Access" subsection: `AUTH_JWT_HEADER=Cf-Access-Jwt-Assertion`, `OIDC_ISSUER` the team domain, `OIDC_AUDIENCE` the application AUD tag, `OIDC_JWKS_URL` the team's `/cdn-cgi/access/certs` URL, and the right `OIDC_REQUIRE_EMAIL_VERIFIED` value. Confirm the Access token claims (whether `email_verified` is present) against Cloudflare's current Access JWT documentation and cite the page in the report.
 
 - [ ] **Step 1: Failing tests:** `test_oidc_reads_configured_header` (a valid token in `Cf-Access-Jwt-Assertion` signs in when that header is configured; the same token in `Authorization` is refused then); `test_subject_papers_listed_newest_first_and_scoped` (B gets 404 for A's subject); `test_options_lists_configured_values` (matches the fixture config; a disabled question type is absent).
 - [ ] **Step 2: Run them**; confirm failures.
@@ -121,7 +125,7 @@
 
 **Interfaces:**
 - `PapersPage({sid})`: lists `listPapers(sid)` (title, status, created time, template name and version), each linking to `#/papers/<pid>`, and a "New paper" button opening `PaperBuilder`.
-- `TemplateForm({onCreated})`: a template name and one row per section: title, question type, Bloom level and difficulty as selects filled from `options()`, count, marks each, optional "Answer any". It shows the computed total (`marks_each * (answer_any ?? count)` summed) and sends `total_marks` equal to it; `createTemplate` errors show their details.
+- `TemplateForm({onCreated})`: a template name and one row per section: title, question type, Bloom level and difficulty as selects filled from `options()`, count, marks each, optional "Answer any", and an optional "Split into parts" control that lists part marks (integers that must sum to marks each, sent as `parts`). It shows the computed total (`marks_each * (answer_any ?? count)` summed) and sends `total_marks` equal to it; `createTemplate` errors show their details.
 - `PaperBuilder({sid, onCreated})`: choose a template from `listTemplates()` (or create one with `TemplateForm`), choose topics (checkboxes from `listTopics`), choose books (checkboxes of ready documents only, all checked by default), a labelled title; "Generate paper" calls `createPaper` and navigates to the new paper.
 
 - [ ] **Step 1: Failing tests:** the select options come from a mocked `options()` and none are hard-coded; the total updates as rows change and the request carries it; only ready documents are offered; a 422 from `createPaper` shows each detail; success navigates to `#/papers/<pid>`.
@@ -138,6 +142,7 @@
 - `PaperPage({pid})`: header with title, status and timings (`first_question_seconds`, `total_seconds` when set); one `SlotCard` per slot; polls while any slot is pending or running. Export panel: "Paper (PDF)", "Answer key (PDF)" (via `exportPdf` and `openPdf`) and "Answer key (JSON)" (downloads the JSON as a file); a 409 `export_blocked` lists each problem.
 - `SlotCard({paper, slot, onChanged})`: status label; `status_detail`; for drafted, needs_review and approved slots, the question, options, answer and rubric; the reviewer verdict when a dispute was escalated (`review.disputed`); each citation with page number and a "View passage" button (`PassageViewer`, which shows the passage text and an "Open page" button); actions "Edit" (`SlotEditor`), "Regenerate" (disabled while pending or running) and "Approve" (only for drafted or needs_review), which sends the shown revision's id. On a 409 from approve, show "This question changed since you opened it. The current version is shown below.", then reload the paper. An evidence-gap slot shows its detail and the hint "Add a book that covers this topic, or choose another topic." and offers only "Regenerate".
 - `SlotEditor({paper, slot, onSaved})`: editable question, answer, rubric items, and the citations kept from the current revision; for `mcq` and `computational_mcq` slots also the options (add, remove, edit) and the correct option (a radio per option, sent as `correct_option`); "Save" calls `editSlot` with only the draft fields (never the stored `verification` record); a 422 shows each detail and keeps the edits. After a faculty edit of a computational slot (`numerical`, `trace`, `computational_mcq`), the server sets `needs_review` with a detail saying the revised answer needs an independent check; show it as returned.
+- Parts: when the revision content has `parts`, `SlotCard` shows the stem, then each part with its label, question, options, answer, rubric and citations; `SlotEditor` edits every part (question, answer, rubric, options and key for MCQ parts) and keeps their order and labels; a 422 detail naming a part is shown beside that part.
 - `SlotCard` also shows the arithmetic check for computational slots when the revision content has `verification`: its status (`pass`, `mismatch`, `unsupported`, `unavailable`, `invalid`), its detail, and the solver's expression when present. Question types and their labels still come from `options()`.
 
 - [ ] **Step 1: Failing tests:** an evidence-gap slot shows its detail, the hint and only "Regenerate"; an MCQ edit sends the edited options and `correct_option` and no `verification` key; a computational slot shows its verification status and expression; approve sends the shown revision id; a 409 on approve shows the changed message and triggers a reload; a blocked export lists each problem; polling stops when every slot has an outcome; a disputed review shows the reviewer's verdict; an edit rejected with 422 keeps the typed text.
@@ -145,3 +150,21 @@
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** tests, typecheck, build; run the app against a local backend (`tribunal serve` with `AUTH_MODE=dev` plus `npm run dev` with `VITE_AUTH_MODE=dev`) and walk the flow once: create a subject, upload a PDF, wait for ready, build a 3-question paper, approve, export. Record what you saw in the report.
 - [ ] **Step 5: README** for `frontend/`: dev setup (backend command, `VITE_AUTH_MODE=dev`, the proxy), `npm test`, `npm run build` output used by the gateway Worker, and that legacy screens are no longer in the navigation. **Commit** `feat(frontend): paper review, approval and export`.
+
+### Task 8: Stage history panel
+
+Runs after the question-pipeline plan's Task 7 (the `GET /api/papers/{pid}/slots/{n}/steps` route) is merged into this branch.
+
+**Files:**
+- Create: `frontend/components/faculty/StageHistory.tsx`, test beside it
+- Modify: `frontend/services/tribunalApi.ts`, `frontend/services/tribunalTypes.ts`, `frontend/components/faculty/SlotCard.tsx`
+
+**Interfaces:**
+- `listSlotSteps(pid, n) -> Promise<Step[]>` with `Step = {stage, attempt, outcome, feedback, revision_id, model, created_at}`.
+- `StageHistory({pid, n})`: a collapsed "How this question was made" section on each `SlotCard`; expanded, one row per step in order: stage name (Reader, Writer, Structure check, Code gen, Verification, Review, Reasoner, Output), attempt, outcome, and feedback when present; a step sending work back (`revise_question`, `fix_verifier`, a structure failure, a mismatch) is marked as a return to the stage it names.
+
+- [ ] **Step 1: Failing tests:** rows render in order with stage names; a returned step is marked; the section loads only when expanded; an error shows through `ErrorNotice`.
+- [ ] **Step 2: Run**; confirm failures.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** tests, typecheck, build. **Commit** `feat(frontend): stage history for each question`.
+
