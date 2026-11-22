@@ -33,13 +33,24 @@ def export_problems(session: Session, paper, cfg: RuntimeConfig, *,
         c = rev.content
         if not str(c.get("question", "")).strip():
             problems.append(f"question {n} has a blank question")
-        if not str(c.get("answer", "")).strip():
-            problems.append(f"question {n} has a blank answer")
-        total = sum(r["marks"] for r in c.get("rubric", []))
-        if abs(total - slot.marks) > 1e-9:
-            problems.append(f"question {n} rubric totals {total:g}, expected {slot.marks}")
-        if any(cid not in valid for cid in c.get("citations", [])):
-            problems.append(f"question {n} cites a passage outside this paper's sources")
+        if c.get("parts"):
+            for pt, m in zip(c["parts"], slot.parts or [], strict=False):
+                tag = f"question {n} part {pt['label']}"
+                if not str(pt.get("answer", "")).strip():
+                    problems.append(f"{tag} has a blank answer")
+                total = sum(r["marks"] for r in pt.get("rubric", []))
+                if abs(total - m) > 1e-9:
+                    problems.append(f"{tag} rubric totals {total:g}, expected {m}")
+                if any(cid not in valid for cid in pt.get("citations", [])):
+                    problems.append(f"{tag} cites a passage outside this paper's sources")
+        else:
+            if not str(c.get("answer", "")).strip():
+                problems.append(f"question {n} has a blank answer")
+            total = sum(r["marks"] for r in c.get("rubric", []))
+            if abs(total - slot.marks) > 1e-9:
+                problems.append(f"question {n} rubric totals {total:g}, expected {slot.marks}")
+            if any(cid not in valid for cid in c.get("citations", [])):
+                problems.append(f"question {n} cites a passage outside this paper's sources")
         texts.append((n, terms(str(c.get("question", "")))))
     threshold = cfg.generation.duplicate_similarity
     for i, (a, ta) in enumerate(texts):

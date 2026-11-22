@@ -18,6 +18,16 @@ from tribunal.textpolicy import TextPolicy
 __all__ = ["ExportBlocked", "build_export", "render_pdf"]
 
 
+def _resolve(session: Session, ids: list[str]) -> list[dict]:
+    out = []
+    for pid in ids:
+        p = session.get(Passage, pid)
+        doc = session.get(Document, p.document_id)
+        out.append({"passage_id": pid, "document": doc.filename, "page": p.page_number,
+                    "url": f"/api/documents/{p.document_id}/file#page={p.page_number}"})
+    return out
+
+
 def build_export(session: Session, paper, part: Literal["paper", "key"], snapshot: ConfigSnapshot,
                  policy: TextPolicy) -> dict:
     revisions = current_revisions(session, paper)  # read once: what is checked is what is exported
@@ -35,19 +45,17 @@ def build_export(session: Session, paper, part: Literal["paper", "key"], snapsho
         c = rev.content
         q = {"number": slot.number, "marks": slot.marks, "question": c["question"], "options": c.get("options")}
         if c.get("parts"):
-            q["parts"] = [{k: v for k, v in pt.items() if key or k in ("label", "question", "options")}
+            q["parts"] = [{k: v for k, v in pt.items() if k in ("label", "question", "options")}
                           for pt in c["parts"]]
         if key:
             q["answer"] = c["answer"]
             q["rubric"] = c.get("rubric", [])
+            for qp, pt in zip(q.get("parts", []), c.get("parts") or [], strict=True):
+                qp["answer"], qp["rubric"] = pt["answer"], pt.get("rubric", [])
+                if cite:
+                    qp["citations"] = _resolve(session, pt.get("citations", []))
             if cite:
-                q["citations"] = []
-                for pid in c.get("citations", []):
-                    p = session.get(Passage, pid)
-                    doc = session.get(Document, p.document_id)
-                    q["citations"].append({
-                        "passage_id": pid, "document": doc.filename, "page": p.page_number,
-                        "url": f"/api/documents/{p.document_id}/file#page={p.page_number}"})
+                q["citations"] = _resolve(session, c.get("citations", []))
             approvals.append({"number": slot.number, "revision_id": rev.id,
                               "approved_by": session.get(User, rev.approved_by).email,
                               "approved_at": rev.approved_at.isoformat()})

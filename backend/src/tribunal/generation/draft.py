@@ -146,6 +146,14 @@ def check_draft(
         got = draft.parts or []
         if len(got) != len(parts):
             problems.append(f"expected {len(parts)} parts, got {len(got)}")
+        seen: set[str] = set()
+        for i, part in enumerate(got, 1):
+            label = part.label.strip()
+            if not label:
+                problems.append(f"part {i} label is blank")
+            elif label.casefold() in seen:
+                problems.append(f"part label {label} is repeated")
+            seen.add(label.casefold())
         for part, m in zip(got, parts, strict=False):
             if not part.answer.strip():
                 problems.append(f"part {part.label} answer is blank")

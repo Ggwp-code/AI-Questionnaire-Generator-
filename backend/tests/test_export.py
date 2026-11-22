@@ -257,3 +257,55 @@ def test_export_renders_parts(ex):
     assert k["parts"][1]["rubric"] == [{"criterion": "crit two", "marks": 1}]
     cfg = ctx.snapshot.config.export
     assert render_pdf(export(ctx, pid, "key"), font_regular=None, font_bold=None, fallbacks=[], cfg=cfg)
+
+
+def _part(label, text, marks=1, citations=()):
+    return {"label": label, "question": f"{text}?", "answer": f"Ans {text}", "citations": list(citations),
+            "correct_option": 1, "rubric": [{"criterion": "c", "marks": marks}]}
+
+
+def _with_parts(ctx, pid, parts, **top):
+    with ctx.session_factory.begin() as s:
+        s.query(Slot).filter_by(paper_id=pid, number=1).one().parts = [1, 1]
+    set_content(ctx, pid, 1, parts=parts, **top)
+    approve(ctx, pid)
+
+
+def test_parts_slot_without_top_level_answer_exports(ex):
+    ctx, pid, _ = ex
+    _with_parts(ctx, pid, [_part("a", "one"), _part("b", "two")], answer="", rubric=[], citations=[])
+    assert export(ctx, pid, "key")["sections"][0]["questions"][0]["parts"][0]["answer"] == "Ans one"
+
+
+def test_part_problems_block_export(ex):
+    ctx, pid, _ = ex
+    _with_parts(ctx, pid, [_part("a", "one", citations=["nope"]), _part("b", "two", marks=2)])
+    set_content(ctx, pid, 1, parts=[_part("a", "one", citations=["nope"]),
+                                    {**_part("b", "two", marks=2), "answer": " "}])
+    with pytest.raises(ExportBlocked) as e:
+        export(ctx, pid, "key")
+    assert "question 1 part a cites a passage outside this paper's sources" in e.value.details
+    assert "question 1 part b rubric totals 2, expected 1" in e.value.details
+    assert "question 1 part b has a blank answer" in e.value.details
+
+
+def _real_citation(ctx, pid):
+    with ctx.session_factory() as s:
+        return s.query(Slot).filter_by(paper_id=pid, number=1).one(), s.query(Passage).first().id
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_key_part_citations_follow_setting(ex, on):
+    ctx, pid, doc = ex
+    object.__setattr__(ctx.snapshot.config.export, "include_citations_in_answer_key", on)  # frozen; ctx is per-test
+    _, passage = _real_citation(ctx, pid)
+    _with_parts(ctx, pid, [_part("a", "one", citations=[passage]), _part("b", "two")])
+    key_part = export(ctx, pid, "key")["sections"][0]["questions"][0]["parts"][0]
+    assert "correct_option" not in key_part
+    if on:
+        assert key_part["citations"][0]["passage_id"] == passage and key_part["citations"][0]["document"]
+        assert key_part["citations"][0]["url"].startswith(f"/api/documents/{doc}/file#page=")
+    else:
+        assert "citations" not in key_part
+    paper_part = export(ctx, pid, "paper")["sections"][0]["questions"][0]["parts"][0]
+    assert set(paper_part) <= {"label", "question", "options"}

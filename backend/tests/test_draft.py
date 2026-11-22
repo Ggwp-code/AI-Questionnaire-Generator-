@@ -153,3 +153,8 @@ def test_draft_without_parts_unchanged():
     assert _check(d) == _check(d, parts=None) == []
     assert _check(Draft(question="Q", answer="", parts=[_part("a", 2)])) == [
         "answer is blank", "rubric is empty", "no citations"]
+
+
+def test_part_labels_blank_or_repeated():
+    d = Draft(question="Stem", answer="", parts=[_part("a", 1), _part(" ", 1), _part(" A ", 1)])
+    assert _check(d, parts=[1, 1, 1]) == ["part 2 label is blank", "part label A is repeated"]
