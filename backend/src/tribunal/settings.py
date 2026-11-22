@@ -15,8 +15,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, ValidationError, field_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 from tribunal.errors import ConfigurationError
 
@@ -45,7 +46,7 @@ class Settings(BaseSettings):
     institution_name: str | None = None
 
     # Network
-    host: str = "0.0.0.0"
+    host: str | None = None  # 127.0.0.1 on local and test, 0.0.0.0 on hosted profiles (see _default_host)
     port: int = 8000
     allowed_origins: CsvList = Field(default_factory=list)
 
@@ -113,6 +114,12 @@ class Settings(BaseSettings):
     def _lower_emails(cls, value: list[str]) -> list[str]:
         return [v.lower() for v in value]
 
+    @model_validator(mode="after")
+    def _default_host(self) -> Settings:
+        if self.host is None:
+            self.host = "0.0.0.0" if self.app_profile in HOSTED_PROFILES else "127.0.0.1"
+        return self
+
     @property
     def is_hosted(self) -> bool:
         return self.app_profile in HOSTED_PROFILES
@@ -124,6 +131,9 @@ class Settings(BaseSettings):
             secret = getattr(self, name)
             if secret is not None and secret.get_secret_value():
                 values.append(secret.get_secret_value())
+        password = make_url(self.database_url).password
+        if password:
+            values.append(password)
         return values
 
 

@@ -46,4 +46,19 @@ def test_test_profile_loads(settings):
 def test_redacting_filter_hides_secret():
     record = logging.LogRecord("t", logging.INFO, __file__, 1, "key=supersecretvalue", None, None)
     RedactingFilter(["supersecretvalue"]).filter(record)
-    assert record.getMessage() == "key=[redacted]"
+    assert record.getMessage() == "key=[REDACTED]"
+
+
+def test_host_default_by_profile(test_env, monkeypatch):
+    assert load_settings().host == "127.0.0.1"
+    monkeypatch.setenv("HOST", "10.1.2.3")
+    assert load_settings().host == "10.1.2.3"
+    monkeypatch.delenv("HOST")
+    monkeypatch.setenv("APP_PROFILE", "staging")
+    from tribunal.settings import Settings
+    assert Settings(_env_file=None).host == "0.0.0.0"
+
+
+def test_database_password_is_a_secret(test_env, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:dbpassword123@h/db")
+    assert "dbpassword123" in load_settings().secret_values()

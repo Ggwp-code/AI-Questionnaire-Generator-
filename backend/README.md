@@ -68,7 +68,7 @@ Commands
 
     tribunal check-config   validate settings and runtime configuration (exit 2 names each problem)
     tribunal db-upgrade     apply database migrations
-    tribunal serve          run the HTTP API
+    tribunal serve          run the HTTP API (HOST defaults to 127.0.0.1 on local/test, 0.0.0.0 on hosted profiles)
     tribunal worker         run the background job worker
     tribunal scan-text --config backend/config/runtime.example.yaml PATH...
                             report emoji in text files (exit 1 on findings)

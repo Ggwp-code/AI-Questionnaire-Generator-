@@ -54,10 +54,10 @@ def test_run_once_marks_document_failed(ctx, monkeypatch):
         s.add(doc)
         s.flush()
         doc_id = doc.id
-        enqueue(s, "ingest", doc_id, ctx.snapshot.snapshot_id)
+        job_id = enqueue(s, "ingest", doc_id, ctx.snapshot.snapshot_id).id
 
     def boom(_ctx, _job):
-        raise RuntimeError("kaput")
+        raise RuntimeError("/srv/x.py SELECT secret")
 
     monkeypatch.setitem(worker.HANDLERS, "ingest", boom)
     for _ in range(ctx.snapshot.config.retries.max_attempts):
@@ -65,7 +65,11 @@ def test_run_once_marks_document_failed(ctx, monkeypatch):
     assert worker.run_once(ctx) is False
     with ctx.session_factory() as s:
         d = s.get(Document, doc_id)
-        assert d.status == "failed" and d.error == "kaput"
+        assert d.status == "failed" and d.error == f"internal error in job {job_id}; see the worker log"
+        assert "/srv" not in d.error
+
+
+test_unexpected_error_text_is_generic = test_run_once_marks_document_failed
 
 
 def _doc(ctx):

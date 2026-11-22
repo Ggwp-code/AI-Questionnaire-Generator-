@@ -115,7 +115,9 @@ def run_once(ctx: AppContext) -> bool:
         log.exception("job %s (%s) failed", job.id, job.kind)
         max_attempts = 0 if isinstance(exc, _PermanentFailure) else retries.max_attempts
         hook = FINAL_FAILURE.get(job.kind)
-        error = str(exc)
+        # Only our own errors carry text safe to show; anything else may hold paths or SQL.
+        error = (str(exc) if isinstance(exc, (TribunalError, _PermanentFailure))
+                 else f"internal error in job {job.id}; see the worker log")
         requeued = fail_job(ctx.session_factory, job.id, job.attempts, error, max_attempts,
                             lambda session: hook(session, job, error) if hook else None,
                             retries.job_retry_delay_seconds)

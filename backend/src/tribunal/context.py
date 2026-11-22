@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy.orm import Session, sessionmaker
 
 from tribunal.db.migrate import upgrade
@@ -75,6 +78,20 @@ class AppContext:
         return TextPolicy(snapshot.config.text_policy.preserve_codepoints)
 
 
+def startup_problems(settings: Settings, snapshot: ConfigSnapshot) -> list[str]:
+    return hosted_profile_problems(
+        snapshot, hosted=settings.is_hosted, allow_stub=settings.allow_stub_provider
+    ) + provider_credential_problems(snapshot)
+
+
+def _at_head(engine) -> bool:
+    cfg = Config()
+    cfg.set_main_option("script_location", "tribunal:migrations")
+    heads = set(ScriptDirectory.from_config(cfg).get_heads())
+    with engine.connect() as conn:
+        return set(MigrationContext.configure(conn).get_current_heads()) == heads
+
+
 def build_context(
     settings: Settings,
     *,
@@ -83,9 +100,7 @@ def build_context(
     provider_factory: Callable[[str, ProviderConfig], ModelProvider] | None = None,
 ) -> AppContext:
     snapshot = load_runtime_config(settings.runtime_config)
-    problems = hosted_profile_problems(
-        snapshot, hosted=settings.is_hosted, allow_stub=settings.allow_stub_provider
-    ) + provider_credential_problems(snapshot)
+    problems = startup_problems(settings, snapshot)
     if problems:
         raise ConfigurationError(problems)
     envs = [p.api_key_env for p in snapshot.config.providers.values() if p.api_key_env]
@@ -94,6 +109,8 @@ def build_context(
         upgrade(settings.database_url)
     engine = make_engine(settings.database_url, pool_size=settings.db_pool_size, max_overflow=settings.db_max_overflow)
     factory = make_session_factory(engine)
+    if not migrate and not _at_head(engine):
+        raise ConfigurationError(["database is not migrated: run tribunal db-upgrade"])
     with factory.begin() as session:
         if session.get(ConfigSnapshotRow, snapshot.snapshot_id) is None:
             session.add(ConfigSnapshotRow(id=snapshot.snapshot_id, content=snapshot.as_json()))

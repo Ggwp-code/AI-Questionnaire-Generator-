@@ -16,7 +16,7 @@ import time
 
 request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
 
-_REDACTED = "[redacted]"
+_REDACTED = "[REDACTED]"
 
 
 class RedactingFilter(logging.Filter):
@@ -25,17 +25,24 @@ class RedactingFilter(logging.Filter):
         self.secrets = sorted({s for s in secrets if s and len(s) >= 6}, key=len, reverse=True)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if not self.secrets:
-            return True
         message = record.getMessage()
-        redacted = message
-        for secret in self.secrets:
-            if secret in redacted:
-                redacted = redacted.replace(secret, _REDACTED)
+        redacted = self._clean(message)
         if redacted != message:
             record.msg = redacted
             record.args = None
+        # Format the traceback here so every formatter emits the redacted text.
+        if record.exc_info and not record.exc_text:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text:
+            record.exc_text = self._clean(record.exc_text)
+        if record.stack_info:
+            record.stack_info = self._clean(record.stack_info)
         return True
+
+    def _clean(self, text: str) -> str:
+        for secret in self.secrets:
+            text = text.replace(secret, _REDACTED)
+        return text
 
 
 class JsonFormatter(logging.Formatter):
@@ -52,8 +59,10 @@ class JsonFormatter(logging.Formatter):
         extra = getattr(record, "fields", None)
         if isinstance(extra, dict):
             payload.update(extra)
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+        if record.exc_info or record.exc_text:
+            payload["exception"] = record.exc_text or self.formatException(record.exc_info)
+        if record.stack_info:
+            payload["stack"] = record.stack_info
         return json.dumps(payload, ensure_ascii=False)
 
 

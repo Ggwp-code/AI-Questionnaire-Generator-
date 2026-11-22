@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from tribunal.context import startup_problems
 from tribunal.errors import ConfigurationError
 from tribunal.runtime_config import load_runtime_config
 from tribunal.settings import load_settings
@@ -19,7 +20,11 @@ SKIP_DIRS = {"__pycache__", ".venv", "node_modules"}
 
 def _check_config() -> int:
     try:
-        snapshot = load_runtime_config(load_settings().runtime_config)
+        settings = load_settings()
+        snapshot = load_runtime_config(settings.runtime_config)
+        problems = startup_problems(settings, snapshot)
+        if problems:
+            raise ConfigurationError(problems)
     except ConfigurationError as exc:
         for problem in exc.problems:
             print(f"- {problem}", file=sys.stderr)

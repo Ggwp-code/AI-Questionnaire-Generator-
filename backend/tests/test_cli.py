@@ -34,3 +34,19 @@ def test_scan_text_unreadable_file(test_env, tmp_path, capsys):
     (tmp_path / "bad.txt").write_bytes(b"\xff\xfe\xfa")
     assert main(["scan-text", "--config", str(test_env["runtime"]), str(tmp_path)]) == 2
     assert "bad.txt: not scanned" in capsys.readouterr().err
+
+
+def test_check_config_reports_credentials(test_env, monkeypatch, capsys):
+    from pathlib import Path
+    monkeypatch.setenv("RUNTIME_CONFIG", str(Path(__file__).parents[1] / "config" / "runtime.example.yaml"))
+    for name in ("TRIBUNAL_WRITER_MODEL", "TRIBUNAL_REASONER_MODEL", "TRIBUNAL_REVIEWER_MODEL"):
+        monkeypatch.setenv(name, "m")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert main(["check-config"]) == 2
+    assert "OPENAI_API_KEY" in capsys.readouterr().err
+
+
+def test_serve_refuses_unmigrated_database(test_env, capsys):
+    for command in ("serve", "worker"):
+        assert main([command]) == 2
+        assert "database is not migrated: run tribunal db-upgrade" in capsys.readouterr().err
