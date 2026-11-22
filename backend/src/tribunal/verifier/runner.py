@@ -59,8 +59,11 @@ def _kill_group(proc: subprocess.Popen) -> None:
 def run_program(program: str, limits: Limits, python: str = sys.executable) -> RunResult:
     workdir = tempfile.mkdtemp(prefix="verifier-")
     try:
-        with open(os.path.join(workdir, "program.py"), "w", encoding="utf-8") as f:
-            f.write(program)
+        try:
+            with open(os.path.join(workdir, "program.py"), "w", encoding="utf-8") as f:
+                f.write(program)
+        except UnicodeEncodeError:
+            return RunResult("error", None, "program text is not valid UTF-8")
         try:
             proc = subprocess.Popen(
                 [python, "-I", "program.py"],
@@ -95,7 +98,11 @@ def run_program(program: str, limits: Limits, python: str = sys.executable) -> R
                     break
                 ready = select.select(list(open_fds), [], [], min(left, 0.2))[0]
                 if not ready and proc.poll() is not None:
-                    break  # exited; whatever still holds the pipes is not ours to wait for
+                    # Exited: keep a last write that landed after the select, then stop; whatever
+                    # still holds the pipes is not ours to wait for.
+                    ready = select.select(list(open_fds), [], [], 0)[0]
+                    if not ready:
+                        break
                 for fd in ready:
                     chunk = os.read(fd, 65536)
                     if not chunk:

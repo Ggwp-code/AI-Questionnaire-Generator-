@@ -92,9 +92,9 @@ def test_escaped_child_does_not_hold_the_runner():
         "import os, time\n"
         "if os.fork() == 0:\n"
         "    os.setsid()\n"
-        "    time.sleep(60)\n"
+        "    time.sleep(8)\n"
         "    os._exit(0)\n"
-        "time.sleep(60)\n"
+        "time.sleep(8)\n"
     )
     limits = Limits(cpu_seconds=2, wall_seconds=2, memory_mb=256, max_processes=4096, max_file_bytes=65536, max_output_bytes=4096)
     t = time.monotonic()
@@ -172,3 +172,26 @@ def resource_hard_nproc():
 def test_core_dumps_are_disabled():
     r = run_program("import resource\nprint(resource.getrlimit(resource.RLIMIT_CORE)[0])\n", LIMITS)
     assert r.last_line == "0"
+
+
+def test_http_missing_key_and_deep_nesting_are_errors():
+    r = _http(lambda req: httpx.Response(200, json={"status": "ok", "stderr_tail": ""}))
+    assert r.status == "error" and r.stderr_tail == "verifier service unavailable: malformed response"
+    deep = b"[" * 100000 + b"]" * 100000
+    r = _http(lambda req: httpx.Response(200, content=deep))
+    assert r.status == "error" and r.last_line is None
+
+
+def test_invalid_url_raises_inside_httpx():
+    r = _http(lambda req: httpx.Response(200), url="http://\x00v")
+    assert r.status == "error" and r.stderr_tail.startswith("verifier service unavailable:")
+
+
+def test_last_line_written_just_before_exit_is_kept():
+    r = run_program("import os\nos.write(1, b'{\"a\": 1}\\n')\nos._exit(0)\n", LIMITS)
+    assert r.status == "ok" and r.last_line == '{"a": 1}'
+
+
+def test_lone_surrogate_program_is_an_error_result():
+    r = run_program("x = '\ud800'\n", LIMITS)
+    assert r.status == "error" and r.stderr_tail == "program text is not valid UTF-8"

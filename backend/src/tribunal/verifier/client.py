@@ -43,12 +43,13 @@ class HttpVerifier:
                 return _unavailable(str(resp.status_code))
             try:
                 body = resp.json()
-            except ValueError:
+            except (ValueError, RecursionError):
                 return _unavailable("malformed response")
             if (
                 not isinstance(body, dict)
                 or body.get("status") not in ("ok", "error", "timeout", "too_large")
-                or not isinstance(body.get("last_line"), (str, type(None)))
+                or "last_line" not in body
+                or not isinstance(body["last_line"], (str, type(None)))
                 or not isinstance(body.get("stderr_tail"), str)
             ):
                 return _unavailable("malformed response")
