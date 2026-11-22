@@ -27,6 +27,7 @@ def enqueue(session: Session, kind: str, target_id: str, snapshot_id: str) -> Jo
     job = Job(kind=kind, target_id=target_id, config_snapshot_id=snapshot_id)
     session.add(job)
     session.flush()
+    session.info.setdefault("tribunal_notify", []).append((kind, job.id))  # sent by the after_commit listener
     return job
 
 

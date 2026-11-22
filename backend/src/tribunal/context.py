@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from sqlalchemy import event
 from sqlalchemy.orm import Session, sessionmaker
 
 from tribunal.db.migrate import upgrade
@@ -17,6 +18,7 @@ from tribunal.errors import ConfigurationError, NotFound
 from tribunal.generation.providers import make_provider
 from tribunal.generation.providers.base import ModelProvider
 from tribunal.ingestion.ocr import OcrEngine, make_ocr_engine
+from tribunal.jobs.notify import CloudflareQueueNotifier, NullNotifier
 from tribunal.logging_setup import collect_provider_secrets, configure_logging
 from tribunal.retrieval.embedding import Embedder, make_embedder
 from tribunal.runtime_config import (
@@ -41,6 +43,7 @@ class AppContext:
     store: LocalStore | S3Store
     ocr_override: OcrEngine | None = None
     provider_factory: Callable[[str, ProviderConfig], ModelProvider] | None = None
+    notifier: CloudflareQueueNotifier | NullNotifier = field(default_factory=NullNotifier)
     _providers: dict[tuple[str, str], ModelProvider] = field(default_factory=dict)
     _snapshots: dict[str, ConfigSnapshot] = field(default_factory=dict)
     _embedders: dict[str, Embedder] = field(default_factory=dict)
@@ -114,4 +117,15 @@ def build_context(
     with factory.begin() as session:
         if session.get(ConfigSnapshotRow, snapshot.snapshot_id) is None:
             session.add(ConfigSnapshotRow(id=snapshot.snapshot_id, content=snapshot.as_json()))
-    return AppContext(settings, snapshot, factory, make_store(settings), ocr_override, provider_factory)
+    ctx = AppContext(settings, snapshot, factory, make_store(settings), ocr_override, provider_factory)
+    if settings.job_notify == "cloudflare_queue":
+        ctx.notifier = CloudflareQueueNotifier(settings)
+
+    def send(session):
+        pending, session.info["tribunal_notify"] = session.info.get("tribunal_notify", []), []
+        for kind, job_id in pending:
+            ctx.notifier.notify(kind, job_id)
+
+    event.listen(factory, "after_commit", send)
+    event.listen(factory, "after_rollback", lambda session: session.info.pop("tribunal_notify", None))
+    return ctx
