@@ -20,6 +20,7 @@ from tribunal.errors import Conflict, NotFound, ValidationFailed
 from tribunal.export.render import build_export, render_pdf
 from tribunal.generation.blueprint import expand_blueprint, parse_template_spec
 from tribunal.generation.draft import Draft, check_draft
+from tribunal.generation.verification import COMPUTATIONAL_TYPES
 from tribunal.jobs.queue import enqueue
 
 router = APIRouter(prefix="/api")
@@ -206,7 +207,12 @@ def edit_slot(pid: str, n: int, body: EditIn, user: User = Depends(current_user)
     rev = Revision(slot_id=slot.id, number=number, author="faculty", content=draft.model_dump(), created_by=user.id)
     session.add(rev)
     session.flush()
-    slot.current_revision_id, slot.status, slot.status_detail = rev.id, "drafted", None
+    slot.current_revision_id = rev.id
+    if slot.question_type in COMPUTATIONAL_TYPES:
+        slot.status = "needs_review"
+        slot.status_detail = "Faculty edit requires an independent check of the revised answer."
+    else:
+        slot.status, slot.status_detail = "drafted", None
     return _rev_json(rev)
 
 

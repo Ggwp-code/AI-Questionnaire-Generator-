@@ -1,4 +1,4 @@
-version: "example-1"
+version: "example-2"
 providers:
   openai: {kind: openai, api_key_env: OPENAI_API_KEY, max_concurrent: 4, timeout_seconds: 120}
 roles:
@@ -12,6 +12,11 @@ roles:
     model: "${TRIBUNAL_REVIEWER_MODEL:?model id for the reviewer role}"
     prompt: reviewer
     max_output_tokens: 1000
+  codegen:
+    provider: openai
+    model: "${TRIBUNAL_REVIEWER_MODEL:?model id for the reviewer role}"
+    prompt: codegen
+    max_output_tokens: 500
   reasoner:
     provider: openai
     model: "${TRIBUNAL_REASONER_MODEL:?model id for the reasoner role}"
@@ -20,6 +25,7 @@ roles:
 prompts:
   writer: {file: prompts/writer.yaml}
   reviewer: {file: prompts/reviewer.yaml}
+  codegen: {file: prompts/codegen.yaml}
 retrieval:
   embedding: {provider: hashing, model: hashing-v1, dimensions: 256}
   chunk_chars: 800
@@ -55,6 +61,11 @@ ingestion:
 generation:
   question_types:
     short_answer: {label: "Short answer", enabled: true}
+    long_answer: {label: "Long answer", enabled: true}
+    mcq: {label: "Multiple choice", enabled: true}
+    numerical: {label: "Numerical", enabled: true}
+    trace: {label: "Trace", enabled: true}
+    computational_mcq: {label: "Computational multiple choice", enabled: true}
   bloom_levels:
     - {key: remember, label: Remember, description: Recall facts from the source}
     - {key: understand, label: Understand, description: Explain ideas in own words}

@@ -60,3 +60,30 @@ def test_lease_must_exceed_deadline(test_env):
         load_runtime_config(copy)
     assert any("retries.lease_seconds must be greater than budgets.paper_deadline_seconds" in p
                for p in exc.value.problems)
+
+
+def test_example_question_formats_and_codegen_prompt(monkeypatch):
+    from tribunal.generation.prompts import render
+
+    for role in ("WRITER", "REVIEWER", "REASONER"):
+        monkeypatch.setenv(f"TRIBUNAL_{role}_MODEL", role.lower())
+    config = load_runtime_config(EXAMPLE).config
+    expected = {"short_answer", "long_answer", "mcq", "numerical", "trace", "computational_mcq"}
+    assert expected <= set(config.question_type_keys())
+    assert expected <= set(config.prompts["writer"].type_instructions)
+    codegen = config.roles["codegen"]
+    assert codegen.model == config.roles["reviewer"].model
+    _, user = render(config.prompts[codegen.prompt], question_block="Compute the area.")
+    assert user.strip() == "Compute the area."
+
+
+def test_older_short_answer_snapshot_without_codegen_loads(snapshot):
+    from tribunal.runtime_config import snapshot_from_json
+
+    content = snapshot.as_json()
+    content["roles"].pop("codegen", None)
+    content["prompts"].pop("codegen", None)
+    content["generation"]["question_types"] = {"short_answer": {"label": "Short answer", "enabled": True}}
+    restored = snapshot_from_json(content).config
+    assert restored.question_type_keys() == ["short_answer"]
+    assert restored.generation.question_types["short_answer"].writer_role == "writer"

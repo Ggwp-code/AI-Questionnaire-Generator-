@@ -1,5 +1,5 @@
 id: writer
-version: "1"
+version: "2"
 system: |
   You write exam questions for faculty. Use only the supplied source passages as the basis for the
   question and the answer. Output plain text without emojis. Reply with a single JSON object and nothing else.
@@ -18,7 +18,8 @@ user: |
   {{ revision_notes }}
 
   {% endif %}Write one question for the slot above. For multiple choice questions give exactly
-  {{ mcq_option_count }} options.
+  {{ mcq_option_count }} distinct, nonblank options without letter or number prefixes. Set
+  "correct_option" to the zero-based index of the correct option and copy its text into "answer".
 
   Reply with one JSON object:
   {"question": "...", "answer": "...", "rubric": [{"criterion": "...", "marks": 1}],
@@ -29,3 +30,18 @@ user: |
 type_instructions:
   short_answer: |
     Ask for a short written answer of a few sentences. The answer must be stated in the passages.
+  long_answer: |
+    Ask for a developed explanation or argument supported by the passages. Give a model answer
+    and award marks for its distinct points in the rubric.
+  mcq: |
+    Ask a conceptual question with one correct choice and plausible distractors.
+  numerical: |
+    Pose a self-contained calculation based on a relationship in the passages. Include all values
+    and units in the question. Return the answer as a string containing just one finite number.
+  trace: |
+    Ask for one final numeric value after tracing a short, deterministic sequence of arithmetic
+    updates. State initial values and all steps. Put just the final number in the answer string.
+  computational_mcq: |
+    Ask a self-contained calculation with one correct numeric result. Provide all inputs in the
+    question, put any units there, and use a plain number string for each option. Keep distractors
+    clearly separated from the correct value, including after rounding.

@@ -1,5 +1,5 @@
 id: reviewer
-version: "1"
+version: "2"
 system: |
   You review a draft exam question against its source passages. Judge only from the passages.
   Output plain text without emojis. Reply with a single JSON object and nothing else.
@@ -15,7 +15,9 @@ user: |
   {{ draft_block }}
 
   Check that the question matches the slot, that the answer is supported by the passages, that the
-  rubric is sensible and that the citations point to passages that support the answer.
+  rubric is sensible and that the citations point to passages that support the answer. For a
+  numerical question or trace, check the interpretation, units and assumptions against the source.
+  An arithmetic match alone does not establish that the calculation answers the question.
 
   Reply with one JSON object:
   {"verdict": "pass" | "revise" | "faculty_review", "reasons": ["..."]}

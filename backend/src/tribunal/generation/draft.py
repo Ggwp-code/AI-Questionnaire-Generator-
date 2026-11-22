@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from fractions import Fraction
 from typing import Literal
 
 from pydantic import BaseModel, ValidationError
@@ -40,6 +41,19 @@ class DraftInvalid(ValidationFailed):
 
 
 _FENCE = re.compile(r"^```[\w-]*[ \t]*\n?(.*?)\n?```$", re.DOTALL)
+_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE]([+-]?[0-9]+))?")
+NUMERICAL_ANSWER_TYPES = frozenset({"numerical", "numeric", "calculation"})
+
+
+def parse_number(text: str) -> Fraction:
+    """Parse a plain decimal or scientific notation within the verification limits."""
+    if len(text) > 80:
+        raise ValueError
+    text = text.strip()
+    match = _NUMBER.fullmatch(text)
+    if not match or abs(int(match.group(1) or 0)) > 100:
+        raise ValueError
+    return Fraction(text)
 
 
 def parse_json_object(text: str) -> dict:
@@ -106,10 +120,32 @@ def check_draft(
             problems.append(f"question matches placeholder pattern '{p}'")
         if re.search(p, draft.answer):
             problems.append(f"answer matches placeholder pattern '{p}'")
-    if question_type == "mcq":
-        k = len(draft.options or [])
+    if question_type in {"mcq", "computational_mcq"}:
+        options = [" ".join(option.split()) for option in draft.options or []]
+        k = len(options)
         if k != mcq_option_count:
             problems.append(f"expected {mcq_option_count} options, got {k}")
+        nonblank = all(options)
+        distinct = len({option.casefold() for option in options}) == k
+        if not nonblank:
+            problems.append("options must be nonblank")
+        if not distinct:
+            problems.append("options must be distinct")
         if draft.correct_option is None or not 0 <= draft.correct_option < k:
             problems.append("correct_option is missing or out of range")
+        elif " ".join(draft.answer.split()) != options[draft.correct_option]:
+            problems.append("answer must match the selected option text")
+        if question_type == "computational_mcq" and nonblank and distinct:
+            try:
+                values = {parse_number(option) for option in draft.options or []}
+            except ValueError:
+                problems.append("computational options must be plain numbers")
+            else:
+                if len(values) != k:
+                    problems.append("computational option values must be distinct")
+    if question_type in NUMERICAL_ANSWER_TYPES and draft.answer.strip():
+        try:
+            parse_number(draft.answer)
+        except ValueError:
+            problems.append("answer must be a plain number")
     return problems

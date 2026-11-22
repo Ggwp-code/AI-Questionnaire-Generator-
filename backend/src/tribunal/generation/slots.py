@@ -10,9 +10,18 @@ from tribunal.context import AppContext
 from tribunal.db.models import Job, Paper, Revision, Slot, Topic
 from tribunal.db.types import utcnow
 from tribunal.generation.calls import BudgetExhausted, call_with_retries, reserve_tokens, settle_tokens
-from tribunal.generation.draft import DraftInvalid, Review, check_draft, parse_draft, parse_review
+from tribunal.generation.draft import (
+    Draft,
+    DraftInvalid,
+    Review,
+    check_draft,
+    parse_draft,
+    parse_json_object,
+    parse_review,
+)
 from tribunal.generation.prompts import draft_block, passages_block, render, slot_block
 from tribunal.generation.providers.base import ProviderError, ProviderResult
+from tribunal.generation.verification import COMPUTATIONAL_TYPES, verify_solution
 from tribunal.jobs.queue import ClaimedJob, owned_transaction
 from tribunal.retrieval.search import rank_passages, searchable_passages
 from tribunal.runtime_config import ConfigSnapshot
@@ -88,12 +97,33 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
     if found.gap:
         return "evidence_gap", found.gap
 
-    _, writer_role = ctx.provider(snapshot, "writer")
-    wt = cfg.prompts[writer_role.prompt]
+    writer = g.question_types[slot.question_type].writer_role
+    wt = cfg.prompts[cfg.roles[writer].prompt]
     sblock, pblock = slot_block(slot, cfg), passages_block(found.passages)
     passage_ids = {p.passage_id for p in found.passages}
     attempts = 1 + g.max_revisions
     problems: list[str] = []
+
+    def verify(draft: Draft) -> dict:
+        role = cfg.roles.get("codegen")
+        if role is None:
+            return {"status": "unavailable", "detail": "codegen role is missing from this configuration"}
+        template = cfg.prompts[role.prompt]
+        question = draft.model_dump(include={"question", "options"}, exclude_none=True)
+        system, user = render(template, question_block=draft_block(question))
+        for attempt in range(2):
+            try:
+                result, model = call("codegen", system, user)
+            except ProviderError:
+                return {"status": "unavailable", "detail": "The codegen provider was unavailable.", "model": role.model}
+            status, detail = verify_solution(result.text, draft, slot.question_type, g.numeric_relative_tolerance)
+            if status != "invalid" or attempt == 1:
+                break
+            user += f"\nYour previous verification was invalid. Correct this problem: {detail}"
+        record = {"status": status, "detail": detail, "model": model, "prompt_version": f"{template.id}@{template.version}"}
+        if status in ("pass", "mismatch"):
+            record.update(parse_json_object(result.text))
+        return record
 
     def review_draft(role_name: str, content: dict) -> tuple[Review, str]:
         """A failing or unparseable reviewer never passes: it asks for a person."""
@@ -110,7 +140,7 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
             wt, slot_block=sblock, passages_block=pblock,
             type_instructions=wt.type_instructions.get(slot.question_type, ""),
             revision_notes="\n".join(f"- {p}" for p in problems), mcq_option_count=g.mcq_option_count)
-        res, model = call("writer", system, user)
+        res, model = call(writer, system, user)
         try:
             draft = parse_draft(res.text, policy)
         except DraftInvalid as exc:
@@ -130,15 +160,26 @@ def _generate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str,
                                placeholder_patterns=g.placeholder_patterns, mcq_option_count=g.mcq_option_count)
         if problems:
             continue
+        content = draft.model_dump()
+        if slot.question_type in COMPUTATIONAL_TYPES:
+            verification = verify(draft)
+            with owned_transaction(ctx.session_factory, owner) as s:
+                s.get(Revision, rev_id).review = {"verification": verification}
+            if verification["status"] == "mismatch":
+                problems = [verification["detail"]]
+                continue
+            if verification["status"] != "pass":
+                return "needs_review", verification["detail"]
+            content["verification"] = verification
         if not g.reviewer_enabled:
             return "drafted", None
 
         def save(review: Review, rmodel: str, rev_id: str = rev_id, disputed: dict | None = None) -> None:
             with owned_transaction(ctx.session_factory, owner) as s:
-                s.get(Revision, rev_id).review = {"verdict": review.verdict, "reasons": review.reasons,
-                                                  "model": rmodel, **({"disputed": disputed} if disputed else {})}
+                revision = s.get(Revision, rev_id)
+                revision.review = {**(revision.review or {}), "verdict": review.verdict, "reasons": review.reasons,
+                                   "model": rmodel, **({"disputed": disputed} if disputed else {})}
 
-        content = draft.model_dump()
         review, rmodel = review_draft("reviewer", content)
         save(review, rmodel)
         if review.verdict == "pass":

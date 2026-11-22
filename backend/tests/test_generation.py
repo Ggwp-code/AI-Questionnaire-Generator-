@@ -5,6 +5,7 @@ import re
 from datetime import timedelta
 
 import pytest
+import yaml
 from conftest import make_subject, make_user
 from pdf_fixtures import digital_pdf
 
@@ -33,12 +34,14 @@ class Fake:
 
     def __init__(self, cfg):
         self.stub = StubProvider(cfg)
-        self.writer = self.reviewer = self.reasoner = None
+        self.writer = self.reviewer = self.reasoner = self.codegen = None
         self.prompts: list[str] = []
 
     def complete(self, role, system, user):
         beh = self.reasoner if role.model == "stub-reasoner" else (
             self.writer if role.prompt == "writer" else self.reviewer)
+        if role.prompt == "codegen":
+            beh = self.codegen
         if role.prompt == "writer":
             self.prompts.append(user)
         if beh is None:
@@ -70,8 +73,9 @@ def make_ctx(settings, fake_ocr, holder):
     return ctx
 
 
-def make_paper(ctx, topics=("Decision trees", "Linear regression", "Neural networks"), n=3):
-    spec = dict(SPEC, sections=[dict(SPEC["sections"][0], count=n)], total_marks=2 * n)
+def make_paper(ctx, topics=("Decision trees", "Linear regression", "Neural networks"), n=3, question_type="short_answer"):
+    section = dict(SPEC["sections"][0], count=n, question_type=question_type)
+    spec = dict(SPEC, sections=[section], total_marks=2 * n)
     with ctx.session_factory.begin() as s:
         user = make_user(s, "g@example.com")
         subj = make_subject(s, user, "Digital")
@@ -140,7 +144,8 @@ def test_three_slots_drafted(gen):
 def test_revision_records_versions(gen):
     ctx, pid, _ = gen
     rev = revs(ctx, go(ctx, pid)[0].id)[0]
-    assert (rev.model, rev.prompt_version) == ("stub-writer", "writer@1")
+    template = ctx.snapshot.config.prompts["writer"]
+    assert (rev.model, rev.prompt_version) == ("stub-writer", f"{template.id}@{template.version}")
     assert rev.retrieval_version.startswith("r-")
 
 
@@ -456,3 +461,120 @@ def test_call_that_fits_the_remaining_budget_is_allowed(test_env, monkeypatch, f
     pid = make_paper(ctx, n=1, topics=("Decision trees",))[0]
     (slot,) = go(ctx, pid)
     assert slot.status == "drafted"
+
+
+@pytest.fixture
+def computational(settings, test_env, fake_ocr, fake_holder):
+    def setup(kind="numerical", *, codegen=True, reviewer=True):
+        src = test_env["runtime"]
+        runtime = yaml.safe_load(src.read_text())
+        prompt_dir = src.parents[2] / "config" / "prompts"
+        if codegen:
+            runtime["roles"]["codegen"] = dict(provider="stub", model="stub-codegen", prompt="codegen",
+                                                max_output_tokens=500)
+            runtime["prompts"]["codegen"] = {}
+        for name in runtime["prompts"]:
+            runtime["prompts"][name]["file"] = str(prompt_dir / f"{name}.yaml")
+        runtime["roles"]["math_writer"] = dict(runtime["roles"]["writer"], model="stub-math-writer")
+        runtime["generation"]["question_types"][kind] = dict(label=kind, enabled=True, writer_role="math_writer")
+        runtime["generation"]["reviewer_enabled"] = reviewer
+        path = test_env["tmp"] / "computational.yaml"
+        path.write_text(yaml.safe_dump(runtime))
+        ctx = make_ctx(settings.model_copy(update={"runtime_config": path}), fake_ocr, fake_holder)
+        pid, _ = make_paper(ctx, topics=("Decision trees",), n=1, question_type=kind)
+        fake = fake_holder["fake"]
+
+        def writer(user):
+            draft = json.loads(_good(user))
+            draft.update(question="What is twice two?", answer="4")
+            if kind == "computational_mcq":
+                draft.update(options=["0", "2", "4", "8"], correct_option=2)
+            return json.dumps(draft)
+
+        fake.writer = writer
+        return ctx, pid, fake
+
+    return setup
+
+
+@pytest.mark.parametrize("kind", ["numerical", "calculation", "trace", "computational_mcq"])
+def test_independent_computation_survives_disputed_review(computational, kind):
+    ctx, pid, fake = computational(kind)
+    verifier_calls = []
+
+    def codegen(user):
+        verifier_calls.append(user)
+        assert "What is twice two?" in user
+        assert '"answer":' not in user and "[P:" not in user and '"rubric":' not in user
+        assert '"correct_option":' not in user
+        if kind == "computational_mcq":
+            assert '"options":' in user
+        return '{"expression":"2*2"}'
+
+    def reviewer(user):
+        assert '"verification":' in user and '"expression": "2*2"' in user
+        return verdict("revise")(user)
+
+    fake.codegen, fake.reviewer, fake.reasoner = codegen, reviewer, verdict("pass")
+    (slot,) = go(ctx, pid)
+    assert slot.status == "drafted"
+    revisions = revs(ctx, slot.id)
+    assert len(revisions) == len(verifier_calls) == 2
+    for rev in revisions:
+        assert rev.review["verification"]["status"] == "pass"
+        assert rev.model == "stub-math-writer"
+    assert revisions[-1].review["disputed"]["verdict"] == "revise"
+
+
+def test_mismatch_revises_writer_and_fails_when_exhausted(computational):
+    ctx, pid, fake = computational(reviewer=False)
+    fake.codegen = lambda _: '{"expression":"2+3"}'
+    (slot,) = go(ctx, pid)
+    assert slot.status == "failed"
+    revisions = revs(ctx, slot.id)
+    assert [r.review["verification"]["status"] for r in revisions] == ["mismatch", "mismatch"]
+    assert revisions[0].review["verification"]["detail"] in fake.prompts[1]
+
+
+@pytest.mark.parametrize("fault,expected,call_count", [
+    ("missing", "unavailable", 0), ("provider", "unavailable", 1),
+    ("invalid", "invalid", 2), ("unsupported", "unsupported", 1), ("repair", "pass", 2),
+])
+def test_verification_failures_and_bounded_repair(computational, fault, expected, call_count):
+    ctx, pid, fake = computational(codegen=fault != "missing", reviewer=False)
+    calls = []
+
+    def codegen(user):
+        calls.append(user)
+        if fault == "provider":
+            _raise(user)
+        if fault == "unsupported":
+            return '{"unsupported":true}'
+        if fault == "repair" and len(calls) == 2:
+            return '{"expression":"2+2"}'
+        return "invalid JSON"
+
+    fake.codegen = codegen
+    (slot,) = go(ctx, pid)
+    assert slot.status == ("drafted" if expected == "pass" else "needs_review")
+    (rev,) = revs(ctx, slot.id)
+    assert rev.review["verification"]["status"] == expected
+    assert len(calls) == call_count
+    if call_count == 2:
+        assert "Correct this problem" in calls[1]
+
+
+def test_verification_follows_structural_checks(computational):
+    ctx, pid, fake = computational()
+    original_writer = fake.writer
+
+    def writer(user):
+        draft = json.loads(original_writer(user))
+        draft["citations"] = []
+        return json.dumps(draft)
+
+    fake.writer = writer
+    fake.codegen = lambda _: pytest.fail("structurally invalid draft reached codegen")
+    (slot,) = go(ctx, pid)
+    assert slot.status == "failed" and "no citations" in slot.status_detail
+    assert all(not r.review for r in revs(ctx, slot.id))

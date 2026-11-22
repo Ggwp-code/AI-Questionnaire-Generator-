@@ -83,3 +83,35 @@ def test_review_parse(policy):
 def test_review_bad_verdict(policy):
     with pytest.raises(DraftInvalid):
         parse_review('{"verdict": "ok"}', policy)
+
+
+@pytest.mark.parametrize("question_type", ["mcq", "computational_mcq"])
+def test_choice_structure(question_type):
+    draft = Draft(question="Q?", answer="3", citations=["p1"], rubric=[RubricItem(criterion="x", marks=2)],
+                  options=["1", "2", "3", "4"], correct_option=2)
+    assert _check(draft, question_type=question_type) == []
+    draft.options = ["1", " 1 ", "  ", "4"]
+    assert _check(draft, question_type=question_type) == [
+        "options must be nonblank",
+        "options must be distinct",
+        "answer must match the selected option text",
+    ]
+
+
+@pytest.mark.parametrize(("options", "problem"), [
+    (["1", "two", "3", "4"], "computational options must be plain numbers"),
+    (["1", "1.0", "3", "4"], "computational option values must be distinct"),
+])
+def test_computational_choices_are_distinct_numbers(options, problem):
+    draft = Draft(question="Q?", answer="3", citations=["p1"], rubric=[RubricItem(criterion="x", marks=2)],
+                  options=options, correct_option=2)
+    assert _check(draft, question_type="computational_mcq") == [problem]
+
+
+@pytest.mark.parametrize("question_type", ["numerical", "numeric", "calculation"])
+def test_computational_answer_is_one_plain_number(question_type):
+    draft = Draft(question="Q?", answer="3 cm", citations=["p1"], rubric=[RubricItem(criterion="x", marks=2)])
+    assert _check(draft, question_type=question_type) == ["answer must be a plain number"]
+    assert _check(draft, question_type="trace") == []
+    draft.answer = "3e1"
+    assert _check(draft, question_type=question_type) == []

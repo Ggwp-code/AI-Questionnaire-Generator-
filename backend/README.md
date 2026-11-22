@@ -63,6 +63,34 @@ list reports the excluded page numbers in its excluded_pages field. Changing the
 settings, re-extracts the book on its next ingest; outline topics that the new outline no longer has are hidden and cannot be
 picked for new papers. Renaming an outline topic makes it a faculty topic, which rebuilds keep.
 
+Question generation and verification
+------------------------------------
+
+The example runtime enables short answer, long answer, conceptual MCQ, numerical,
+trace and computational MCQ slots. Each writer receives the slot requirements and retrieved
+source passages. To change a type's writer, set its `generation.question_types.<type>.writer_role`
+to a configured role. The role's prompt supplies the corresponding `type_instructions`.
+
+Both MCQ formats require the configured number of distinct, nonblank choices, a zero-based
+`correct_option` and an answer matching the selected choice. Computational MCQs use numeric
+options. Numerical questions and traces ask for one final number. The question should state
+the inputs, expected units and any arithmetic updates so a solver can work from the question alone.
+
+For a computational slot, the `codegen` role receives the question and any choices. The writer's answer,
+selected index and rubric are withheld. It translates the problem into an arithmetic expression. The backend
+evaluates supported arithmetic and compares the result with the answer using
+`generation.numeric_relative_tolerance`. The example uses 0.01 (1%) and assigns codegen the
+reviewer model. Set `roles.codegen.model` or `roles.codegen.provider` to choose a different
+assignment. A mismatch goes back to the writer within the configured revision limit. An
+unusable expression gets one correction attempt. Unsupported calculations and unavailable
+verification go to faculty review. Each checked revision records its verification outcome.
+Existing short-answer configurations can keep their original roles.
+
+A numeric match checks the calculation represented by the expression. The source reviewer still
+checks whether the question, assumptions, units, answer and rubric follow from the cited passages.
+A trace must reduce to a numeric calculation. Questions requiring arbitrary program execution or
+a nonnumeric result need faculty review. Faculty approval gates release of the answer key.
+
 Commands
 --------
 
