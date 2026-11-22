@@ -1,0 +1,80 @@
+// Gateway and dispatch Worker. Deploy with `npx wrangler deploy --env staging`.
+// Secrets (DATABASE_URL, SIGNING_SECRET, INTERNAL_DISPATCH_TOKEN, ...) are set with
+// `npx wrangler secret put <NAME> --env staging`; nothing secret belongs in this file.
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tribunal",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-04",
+  "assets": {
+    "directory": "../../frontend/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/internal/*"]
+  },
+  "containers": [
+    {
+      "class_name": "ApiContainer",
+      "scheduling_policy": "durable_object",
+      "images": { "base": { "dockerfile": "../api.Dockerfile", "build_context": "../.." } }
+    },
+    {
+      "class_name": "IngestContainer",
+      "scheduling_policy": "durable_object",
+      "images": { "base": { "dockerfile": "../ingest.Dockerfile", "build_context": "../.." } }
+    }
+  ],
+  "exports": {
+    "ApiContainer": { "type": "durable-object", "storage": "sqlite" },
+    "IngestContainer": { "type": "durable-object", "storage": "sqlite" }
+  },
+  "triggers": { "crons": ["* * * * *"] },
+  "durable_objects": {
+    "bindings": [
+      { "name": "API_CONTAINER", "class_name": "ApiContainer" },
+      { "name": "INGEST_CONTAINER", "class_name": "IngestContainer" }
+    ]
+  },
+  "queues": {
+    "consumers": [
+      { "queue": "tribunal-ingestion", "max_batch_size": 10, "max_retries": 5, "dead_letter_queue": "tribunal-ingestion-dlq" },
+      { "queue": "tribunal-generation", "max_batch_size": 10, "max_retries": 5, "dead_letter_queue": "tribunal-generation-dlq" }
+    ]
+  },
+  "env": {
+    // Containers and bindings are not inherited by environments, so they are repeated here.
+    "staging": {
+      "vars": {
+        "APP_PROFILE": "staging",
+        "AUTH_MODE": "oidc",
+        "STORAGE_BACKEND": "s3",
+        "JOB_NOTIFY": "cloudflare_queue",
+        "API_POOL_SIZE": "2",
+        "RUNTIME_CONFIG": "/app/config/runtime.example.yaml"
+      },
+      "containers": [
+        {
+          "class_name": "ApiContainer",
+          "scheduling_policy": "durable_object",
+          "images": { "base": { "dockerfile": "../api.Dockerfile", "build_context": "../.." } }
+        },
+        {
+          "class_name": "IngestContainer",
+          "scheduling_policy": "durable_object",
+          "images": { "base": { "dockerfile": "../ingest.Dockerfile", "build_context": "../.." } }
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "API_CONTAINER", "class_name": "ApiContainer" },
+          { "name": "INGEST_CONTAINER", "class_name": "IngestContainer" }
+        ]
+      },
+      "queues": {
+        "consumers": [
+          { "queue": "tribunal-ingestion", "max_batch_size": 10, "max_retries": 5, "dead_letter_queue": "tribunal-ingestion-dlq" },
+          { "queue": "tribunal-generation", "max_batch_size": 10, "max_retries": 5, "dead_letter_queue": "tribunal-generation-dlq" }
+        ]
+      }
+    }
+  }
+}
