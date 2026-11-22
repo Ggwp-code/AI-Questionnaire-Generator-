@@ -41,6 +41,9 @@ Also required, by profile:
   a PostgreSQL DATABASE_URL, PDF_FONT_REGULAR and STORAGE_BACKEND s3.
   Staging and production also need Postgres with pgvector, an OIDC provider and the s3 extra.
 
+A paper keeps the configuration it was created with: regenerating, editing and exporting it use that
+configuration, and only new papers use the current one.
+
 AUTH_MODE dev trusts an X-Dev-User header and is for local use and tests only.
 
 Runtime configuration

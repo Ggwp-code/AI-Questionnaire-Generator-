@@ -101,7 +101,9 @@ def test_live_scanned_book(test_env, monkeypatch, tmp_path):
     paper = client.get(f"/api/papers/{r.json()['paper_id']}", headers=WHO).json()
     assert [s["status"] in ("drafted", "needs_review") for s in paper["slots"]] == [True] * 3, paper["slots"]
     for slot in paper["slots"]:
-        assert client.post(f"/api/papers/{paper['id']}/slots/{slot['number']}/approve", headers=WHO).status_code == 200
+        approve = client.post(f"/api/papers/{paper['id']}/slots/{slot['number']}/approve", headers=WHO,
+                              json={"revision_id": slot["revision"]["id"]})
+        assert approve.status_code == 200
     key = client.get(f"/api/papers/{paper['id']}/export?part=key&format=json", headers=WHO)
     assert key.status_code == 200, key.text
 

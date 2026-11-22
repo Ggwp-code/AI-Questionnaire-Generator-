@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 from pdf_fixtures import digital_pdf
+from sqlalchemy import select
 
 from tribunal.api.app import create_app
-from tribunal.db.models import Document, Page, Passage, Slot
+from tribunal.db.models import ConfigSnapshotRow, Document, Job, Page, Paper, Passage, Slot
+from tribunal.ingestion.pipeline import ingest_document
 from tribunal.jobs.worker import run_once
+from tribunal.runtime_config import ConfigSnapshot
 
 PAGES = ["Decision trees split data into branches. " * 5, "Linear regression fits lines to data. " * 5]
 SPEC = {"sections": [{"title": "A", "question_type": "short_answer", "count": 3, "marks_each": 2,
@@ -59,6 +62,11 @@ def paper(client, ctx, ready):
     assert r.status_code == 202
     jobs(ctx)
     return r.json()["paper_id"]
+
+
+def approve_slot(client, paper, n, who=A):
+    rev = client.get(f"/api/papers/{paper}", headers=h(who)).json()["slots"][n - 1]["revision"]["id"]
+    return client.post(f"/api/papers/{paper}/slots/{n}/approve", json={"revision_id": rev}, headers=h(who))
 
 
 def test_healthz_and_me(client):
@@ -182,10 +190,10 @@ def test_edit_and_approve(client, paper):
     c = dict(content, answer="Edited answer", question="Why do decision trees overfit noisy training data")
     assert client.put(url, json={"content": c}, headers=h(A)).status_code == 200
     for n in (1, 2, 3):
-        assert client.post(f"/api/papers/{paper}/slots/{n}/approve", headers=h(A)).status_code == 200
+        assert approve_slot(client, paper, n).status_code == 200
     slots = client.get(f"/api/papers/{paper}", headers=h(A)).json()["slots"]
     assert [s["status"] for s in slots] == ["approved"] * 3
-    assert client.post(f"/api/papers/{paper}/slots/1/approve", headers=h(A)).status_code == 409
+    assert approve_slot(client, paper, 1).status_code == 409
     key = client.get(f"/api/papers/{paper}/export?part=key&format=json", headers=h(A))
     assert key.status_code == 200 and str(key.json()).count("Edited answer") >= 1
     pdf = client.get(f"/api/papers/{paper}/export?part=paper&format=pdf", headers=h(A))
@@ -197,7 +205,8 @@ def test_foreign_paper_hidden(client, paper):
     assert client.get(f"/api/papers/{paper}", headers=h(B)).status_code == 404
     assert client.get(f"/api/papers/{paper}/export?part=key", headers=h(B)).status_code == 404
     assert client.put(f"/api/papers/{paper}/slots/1", json={"content": {}}, headers=h(B)).status_code == 404
-    assert client.post(f"/api/papers/{paper}/slots/1/approve", headers=h(B)).status_code == 404
+    assert client.post(f"/api/papers/{paper}/slots/1/approve", json={"revision_id": "x"},
+                       headers=h(B)).status_code == 404
 
 
 def test_no_ready_documents(client):
@@ -357,3 +366,55 @@ def test_oidc_unverified_email_is_refused(ctx, monkeypatch, claim):
 @pytest.mark.parametrize("claim", [False, None])
 def test_oidc_unverified_email_accepted_when_not_required(ctx, monkeypatch, claim):
     assert _oidc_client(ctx, monkeypatch, require_verified=False)(email_verified=claim).status_code == 200
+
+
+def _slot_json(client, paper, n):
+    return client.get(f"/api/papers/{paper}", headers=h(A)).json()["slots"][n - 1]
+
+
+def test_approve_refuses_a_stale_revision(client, paper):
+    first = _slot_json(client, paper, 1)["revision"]
+    edited = client.put(f"/api/papers/{paper}/slots/1", headers=h(A),
+                        json={"content": dict(first["content"], answer="A second instructor's answer")})
+    assert edited.status_code == 200
+    url = f"/api/papers/{paper}/slots/1/approve"
+    r = client.post(url, json={"revision_id": first["id"]}, headers=h(A))
+    assert r.status_code == 409
+    assert r.json()["error"]["message"] == "the question changed since you opened it; review the current revision"
+    now = _slot_json(client, paper, 1)
+    assert now["status"] == "drafted" and now["revision"]["id"] == edited.json()["id"]
+    assert now["revision"]["approved_by"] is None
+    assert client.post(url, headers=h(A)).status_code == 422  # the revision id is required
+    assert client.post(url, json={"revision_id": edited.json()["id"]}, headers=h(A)).status_code == 200
+
+
+def test_regenerate_enqueues_with_the_papers_own_snapshot(client, ctx, paper):
+    newer = ctx.snapshot.model_copy(update={"content_hash": "f" * 64})
+    with ctx.session_factory.begin() as s:
+        s.add(ConfigSnapshotRow(id=newer.snapshot_id, content=newer.as_json()))
+    ctx.snapshot = newer
+    r = client.post(f"/api/papers/{paper}/slots/2/regenerate", headers=h(A))
+    assert r.status_code == 202
+    with ctx.session_factory() as s:
+        assert s.get(Job, r.json()["job_id"]).config_snapshot_id == s.get(Paper, paper).config_snapshot_id
+        assert s.get(Paper, paper).config_snapshot_id != newer.snapshot_id
+
+
+def test_edit_may_not_cite_a_superseded_extraction(client, ctx, paper):
+    first = _slot_json(client, paper, 1)["revision"]
+    cited = first["content"]["citations"]
+    with ctx.session_factory() as s:
+        did = s.get(Paper, paper).document_ids[0]
+        old = set(s.scalars(select(Passage.id).where(Passage.document_id == did)))
+    cfg = ctx.snapshot.config
+    ing = cfg.ingestion.model_copy(update={"outline": cfg.ingestion.outline.model_copy(update={"use_headings": False})})
+    ingest_document(ctx, ConfigSnapshot(config=cfg.model_copy(update={"ingestion": ing}), content_hash="nh"), did)
+    with ctx.session_factory() as s:
+        assert set(s.scalars(select(Passage.id).where(Passage.document_id == did))) > old  # re-indexed
+    stale = sorted(old - set(cited))
+    assert stale, "the fixture needs a passage the current revision does not cite"
+    url = f"/api/papers/{paper}/slots/1"
+    refused = client.put(url, headers=h(A), json={"content": dict(first["content"], citations=cited + stale[:1])})
+    assert refused.status_code == 422
+    kept = client.put(url, headers=h(A), json={"content": dict(first["content"], answer="Edited answer")})
+    assert kept.status_code == 200

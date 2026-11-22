@@ -92,9 +92,14 @@ def get_paper(client, pid, who):
     return r.json()
 
 
+def approve_slot(client, pid, n, who):
+    rev = get_paper(client, pid, who)["slots"][n - 1]["revision"]["id"]
+    return client.post(f"/api/papers/{pid}/slots/{n}/approve", json={"revision_id": rev}, headers=h(who))
+
+
 def approve_all(client, pid, who):
     for n in (1, 2, 3):
-        assert client.post(f"/api/papers/{pid}/slots/{n}/approve", headers=h(who)).status_code == 200
+        assert approve_slot(client, pid, n, who).status_code == 200
 
 
 def test_first_ticket(test_env, settings, fake_ocr, ctx):
@@ -210,7 +215,7 @@ def test_return_later(test_env, settings, ctx):
     blocked = client.get(f"/api/papers/{pid}/export?part=key&format=json", headers=h(A))
     assert blocked.status_code == 409 and blocked.json()["error"]["code"] == "export_blocked"
     assert "question 2 is not approved" in blocked.json()["error"]["details"]
-    assert client.post(f"/api/papers/{pid}/slots/2/approve", headers=h(A)).status_code == 200
+    assert approve_slot(client, pid, 2, A).status_code == 200
     cited = key_citations()
 
     with ctx.session_factory.begin() as s:  # reprocess the identical book

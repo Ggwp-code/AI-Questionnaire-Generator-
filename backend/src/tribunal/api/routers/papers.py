@@ -42,6 +42,10 @@ class EditIn(BaseModel, extra="forbid"):
     content: dict
 
 
+class ApproveIn(BaseModel, extra="forbid"):
+    revision_id: str
+
+
 def _tpl_json(t: PaperTemplate) -> dict:
     return {"id": t.id, "name": t.name, "version": t.version, "spec": t.spec}
 
@@ -160,14 +164,16 @@ def get_paper(pid: str, user: User = Depends(current_user), session: Session = D
 @router.post("/papers/{pid}/slots/{n}/regenerate", status_code=202)
 def regenerate(pid: str, n: int, user: User = Depends(current_user), session: Session = DB,
                ctx: AppContext = Depends(get_ctx)) -> dict:
-    slot = _slot(session, load_paper(session, user, pid), n)
+    paper = load_paper(session, user, pid)
+    slot = _slot(session, paper, n)
     if slot.status in ("pending", "running"):
         raise Conflict("the slot is already being generated")
     rev = session.get(Revision, slot.current_revision_id) if slot.current_revision_id else None
     if rev is not None:
         rev.approved_by = rev.approved_at = None
     slot.status, slot.status_detail = "pending", None
-    return {"job_id": enqueue(session, "regenerate_slot", slot.id, ctx.snapshot.snapshot_id).id}
+    # the paper keeps the configuration it was created with
+    return {"job_id": enqueue(session, "regenerate_slot", slot.id, paper.config_snapshot_id).id}
 
 
 @router.put("/papers/{pid}/slots/{n}")
@@ -185,9 +191,14 @@ def edit_slot(pid: str, n: int, body: EditIn, user: User = Depends(current_user)
         raise ValidationFailed("Draft is invalid", details=[
             f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]) from None
     g = snap.config.generation
+    current = session.get(Revision, slot.current_revision_id) if slot.current_revision_id else None
+    # current extraction of the paper's books, plus what the slot already cites (an approved citation survives a re-index)
+    allowed = set(session.scalars(
+        select(Passage.id).join(Document, Document.id == Passage.document_id)
+        .where(Document.id.in_(paper.document_ids), Passage.extraction_version == Document.extraction_version)))
+    allowed |= set(current.content.get("citations", [])) if current else set()
     problems = check_draft(
-        draft, marks=slot.marks, question_type=slot.question_type,
-        passage_ids=set(session.scalars(select(Passage.id).where(Passage.document_id.in_(paper.document_ids)))),
+        draft, marks=slot.marks, question_type=slot.question_type, passage_ids=allowed,
         placeholder_patterns=g.placeholder_patterns, mcq_option_count=g.mcq_option_count)
     if problems:
         raise ValidationFailed("Draft is invalid", details=problems)
@@ -200,10 +211,12 @@ def edit_slot(pid: str, n: int, body: EditIn, user: User = Depends(current_user)
 
 
 @router.post("/papers/{pid}/slots/{n}/approve")
-def approve(pid: str, n: int, user: User = Depends(current_user), session: Session = DB) -> dict:
+def approve(pid: str, n: int, body: ApproveIn, user: User = Depends(current_user), session: Session = DB) -> dict:
     slot = _slot(session, load_paper(session, user, pid), n)
     if slot.status not in ("drafted", "needs_review") or not slot.current_revision_id:
         raise Conflict("only a drafted or needs_review slot with a revision can be approved")
+    if body.revision_id != slot.current_revision_id:
+        raise Conflict("the question changed since you opened it; review the current revision")
     rev = session.get(Revision, slot.current_revision_id)
     rev.approved_by, rev.approved_at = user.id, utcnow()
     slot.status = "approved"
