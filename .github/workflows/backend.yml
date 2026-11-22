@@ -2,9 +2,9 @@ name: backend
 
 on:
   push:
-    paths: ["backend/**", "docs/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "docs/**", "deploy/**", ".dockerignore", ".github/workflows/backend.yml"]
   pull_request:
-    paths: ["backend/**", "docs/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "docs/**", "deploy/**", ".dockerignore", ".github/workflows/backend.yml"]
 
 jobs:
   test:
@@ -18,3 +18,14 @@ jobs:
       - run: ruff check backend
       - run: cd backend && pytest
       - run: tribunal scan-text --config backend/config/runtime.example.yaml backend docs
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --platform linux/amd64 -f deploy/api.Dockerfile -t tribunal-api .
+      - run: docker build --platform linux/amd64 -f deploy/ingest.Dockerfile -t tribunal-ingest .
+      - run: docker run --rm tribunal-api tribunal --help
+      - run: docker run --rm tribunal-ingest ocrmypdf --version
+      - run: docker run --rm tribunal-ingest tesseract --list-langs | tee langs.txt
+      - run: grep -qx eng langs.txt && grep -qx hin langs.txt

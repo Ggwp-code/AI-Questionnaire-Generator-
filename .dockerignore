@@ -1,0 +1,14 @@
+# Build context is the repository root; only backend/ is needed.
+*
+!backend/
+backend/**/__pycache__
+backend/**/*.pyc
+backend/.pytest_cache
+backend/.ruff_cache
+backend/**/*.egg-info
+backend/**/.venv
+backend/**/*.db
+backend/**/*.sqlite3
+backend/**/data
+backend/**/chroma_db
+backend/**/.env

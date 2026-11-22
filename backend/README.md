@@ -119,3 +119,17 @@ Not in this build
 
 The Anthropic provider, OpenAI embeddings, contents-page outlines, layout extraction,
 progress streaming, legacy import and frontend integration.
+
+## Container images
+
+Both images are `linux/amd64`, built from the repository root, and run `tribunal serve` as a non-root user on port 8080 (`HOST=0.0.0.0`, `PORT=8080`).
+
+- `deploy/api.Dockerfile`: the API and generation jobs. Includes the DejaVu Sans fonts and sets `PDF_FONT_REGULAR` and `PDF_FONT_BOLD` to them.
+- `deploy/ingest.Dockerfile`: ingestion jobs with OCR (`ocrmypdf`, `tesseract-ocr`). Build argument `TESSERACT_LANGS` (default `"eng hin"`) lists one `tesseract-ocr-<lang>` package per entry.
+
+```
+docker build --platform linux/amd64 -f deploy/api.Dockerfile -t tribunal-api .
+docker build --platform linux/amd64 -f deploy/ingest.Dockerfile --build-arg TESSERACT_LANGS="eng hin" -t tribunal-ingest .
+```
+
+No setting or secret is baked in. `APP_PROFILE`, `DATABASE_URL`, credentials and `RUNTIME_CONFIG` arrive as environment variables at container start. The runtime config files are copied to `/app/config`, so `RUNTIME_CONFIG=/app/config/runtime.example.yaml` is a valid value.
