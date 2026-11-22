@@ -369,6 +369,58 @@ def test_replayed_regeneration_job_keeps_the_saved_result_and_the_approval(gen):
     assert len(revs(ctx, slot.id)) == count
 
 
+def _enqueue_regeneration(ctx, pid):
+    go(ctx, pid)
+    slot = slots(ctx, pid)[1]
+    with ctx.session_factory.begin() as s:
+        jid = enqueue(s, "regenerate_slot", slot.id, ctx.snapshot.snapshot_id).id
+    return slot, jid
+
+
+def _assert_retried(ctx, pid, slot, jid):
+    with ctx.session_factory() as s:
+        assert s.get(Job, jid).status == "done"
+    after = slots(ctx, pid)[1]
+    assert after.status in ("drafted", "needs_review")
+    assert after.current_revision_id == revs(ctx, slot.id)[-1].id
+
+
+def test_regeneration_that_fails_after_saving_its_draft_is_retried(gen):
+    ctx, pid, h = gen
+    slot, jid = _enqueue_regeneration(ctx, pid)
+
+    def boom(user):
+        raise RuntimeError("dies during review")
+
+    h["fake"].reviewer = boom
+    assert run_once(ctx)  # the writer saved a revision, then the attempt raised and was requeued
+    h["fake"].reviewer = None
+    assert run_once(ctx)
+    _assert_retried(ctx, pid, slot, jid)
+
+
+def test_regeneration_whose_worker_died_mid_review_is_retried(gen):
+    from tribunal.jobs.queue import claim_next
+
+    ctx, pid, h = gen
+    slot, jid = _enqueue_regeneration(ctx, pid)
+    later = utcnow() + timedelta(seconds=ctx.snapshot.config.retries.lease_seconds + 1)
+    taken = []
+
+    def reclaimed(user):  # another worker takes the job while this one is in review
+        taken.append(claim_next(ctx.session_factory, 60, now=later))
+        return verdict("pass")(user)
+
+    h["fake"].reviewer = reclaimed
+    assert run_once(ctx)  # the old worker finds it lost ownership and stops
+    assert taken[0].id == jid
+    h["fake"].reviewer = None
+    regenerate(ctx, ctx.snapshot, slot.id, owner=taken[0])  # the reclaiming worker runs the job
+    with ctx.session_factory.begin() as s:
+        s.get(Job, jid).status = "done"  # the worker would now finish it
+    _assert_retried(ctx, pid, slot, jid)
+
+
 def _tight_budget(test_env, fake_ocr, fake_holder, monkeypatch, tokens):
     src = test_env["runtime"]
     text = re.sub(r"file: \.\./\.\./config", f"file: {src.parent.parent.parent}/config", src.read_text())

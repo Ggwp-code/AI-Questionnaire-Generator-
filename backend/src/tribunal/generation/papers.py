@@ -50,8 +50,11 @@ def run_paper(ctx: AppContext, snapshot: ConfigSnapshot, paper_id: str, *, owner
 
 def regenerate(ctx: AppContext, snapshot: ConfigSnapshot, slot_id: str, *, owner: ClaimedJob | None = None) -> None:
     with owned_transaction(ctx.session_factory, owner) as s:
-        if owner and s.scalar(select(Revision.id).where(Revision.slot_id == slot_id, Revision.job_id == owner.id)):
-            return  # redelivered after this job saved its result: leave the slot (and any approval) alone
         slot = s.get(Slot, slot_id)
+        # redelivered after this job finished its slot: keep the saved result (and any approval);
+        # a slot still pending or running means the earlier attempt died mid-way, so redo it
+        if owner and slot.status not in ("pending", "running") and s.scalar(
+                select(Revision.id).where(Revision.slot_id == slot_id, Revision.job_id == owner.id)):
+            return
         slot.status, slot.status_detail = "pending", None
     generate_slot(ctx, snapshot, slot_id, owner=owner)
