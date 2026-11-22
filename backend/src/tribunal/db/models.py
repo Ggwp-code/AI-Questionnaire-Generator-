@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, String, Text, UniqueConstraint, false
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from tribunal.db.types import Embedding, JsonType, UTCDateTime, new_id, utcnow
@@ -82,6 +82,7 @@ class Page(Base):
     method: Mapped[str] = mapped_column(String(20))
     char_count: Mapped[int]
     text: Mapped[str] = mapped_column(Text)
+    excluded: Mapped[bool] = mapped_column(default=False, server_default=false())
 
 
 class Passage(Base):

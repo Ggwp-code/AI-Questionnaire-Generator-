@@ -258,18 +258,26 @@ def _evidence_pages(ctx, doc_id) -> set[int]:
             Passage.document_id == doc_id, Passage.extraction_version == doc.extraction_version))}
 
 
+def _excluded(ctx, doc_id):
+    with ctx.session_factory() as s:
+        return {p.page_number: p.excluded for p in s.scalars(select(Page).where(Page.document_id == doc_id))}
+
+
 def test_formula_on_ocr_page_is_not_evidence(ctx, fake_ocr):
     fake_ocr.texts = {1: FORMULA_PAGE, 2: PLAIN_PAGE}
     doc_id = _doc(ctx, scanned_pdf(2))
     doc = _run(ctx, doc_id)
     assert doc.status == "ready"
-    assert doc.error == "pages kept out of evidence because their text has a formula or table: 1"
+    assert doc.error is None
     assert _evidence_pages(ctx, doc_id) == {2}
+    assert _excluded(ctx, doc_id) == {1: True, 2: False}
     with ctx.session_factory() as s:
         found = retrieve(s, ctx.embedder(ctx.snapshot), ctx.snapshot.config.retrieval,
                          subject_id=doc.subject_id, document_ids=[doc_id], query="entropy impurity")
         assert {p.page_number for p in found.passages} <= {2}
         assert len(s.scalars(select(Page)).all()) == 2  # the page text stays for inspection
+    assert _run(ctx, doc_id).error is None  # same version again: nothing is lost
+    assert _excluded(ctx, doc_id) == {1: True, 2: False}
     ingest_document(ctx, _limited(ctx, flagged_page_policy="include"), doc_id)
     assert _evidence_pages(ctx, doc_id) == {1, 2}
 
@@ -296,9 +304,34 @@ def test_formula_on_native_page_kept_when_only_ocr_is_flagged(ctx):
     ("√2 is irrational", {"formula"}),
     ("Name  Age  City\nAnn  30  Pune\nBob  41  Agra", {"table"}),
     ("Only  one  wide line\nthen prose", set()),
+    ("if x < 0.5 go left", {"formula"}),
+    ("y > 2", {"formula"}),
+    ("a \u2212 b", {"formula"}),
+    ("\u03a3 p log p", {"formula"}),
+    ("\u03c3 and \u03bc", {"formula"}),
+    ("P(A|B) / P(B)", {"formula"}),
+    ("n log n + 1", {"formula"}),
+    ("x - y", {"formula"}),
+    ("2*3", {"formula"}),
+    ("a well-known, cost-effective method", set()),
+    ("see pages 10-12", set()),
+    ("and/or", set()),
 ])
 def test_page_flags(text, flags):
     assert page_flags(text) == flags
+
+
+@pytest.mark.parametrize("languages", [["ell"], ["eng", "grc"]])
+def test_greek_letters_are_text_in_a_greek_document(languages):
+    assert page_flags("\u03c3 and \u03bc", languages) == set()
+    assert page_flags("x < 0.5", languages) == {"formula"}
+
+
+def test_greek_document_keeps_greek_page_as_evidence(ctx, fake_ocr):
+    fake_ocr.texts = {1: "\u03c3 and \u03bc " + "text " * 40}
+    doc_id = _doc(ctx, scanned_pdf(1), ["ell"])
+    _run(ctx, doc_id)
+    assert _excluded(ctx, doc_id) == {1: False}
 
 
 def test_extraction_version_changes_with_flag_policy_and_outline(cfg):

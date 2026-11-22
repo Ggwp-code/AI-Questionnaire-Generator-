@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from tribunal.api.deps import DB, current_user, get_ctx, require_member
 from tribunal.context import AppContext
-from tribunal.db.models import Document, Passage, Topic, User
+from tribunal.db.models import Document, Page, Passage, Topic, User
 from tribunal.db.types import new_id
 from tribunal.errors import Conflict, NotFound, TribunalError, ValidationFailed
 from tribunal.jobs.queue import enqueue
@@ -29,12 +29,12 @@ class TitleIn(BaseModel, extra="forbid"):
     title: str = Field(min_length=1, max_length=500)
 
 
-def _doc_json(d: Document) -> dict:
+def _doc_json(d: Document, excluded: list[int] = ()) -> dict:
     # Upload to searchable: from the accepted upload to the index becoming ready.
     searchable = (d.ready_at - d.created_at).total_seconds() if d.ready_at else None
     return {"id": d.id, "filename": d.filename, "status": d.status, "error": d.error,
             "page_count": d.page_count, "created_at": d.created_at, "ready_at": d.ready_at,
-            "searchable_seconds": searchable}
+            "searchable_seconds": searchable, "excluded_pages": list(excluded)}
 
 
 def _topic_json(t: Topic) -> dict:
@@ -77,7 +77,13 @@ def upload(sid: str, file: UploadFile = File(...), languages: str | None = Form(
 def list_documents(sid: str, user: User = Depends(current_user), session: Session = DB) -> list[dict]:
     require_member(session, sid, user)
     docs = session.scalars(select(Document).where(Document.subject_id == sid).order_by(Document.created_at, Document.id))
-    return [_doc_json(d) for d in docs]
+    docs = list(docs)
+    excluded: dict[str, list[int]] = {}
+    for did, n in session.execute(select(Page.document_id, Page.page_number)
+                                  .where(Page.document_id.in_([d.id for d in docs]), Page.excluded)
+                                  .order_by(Page.page_number)):
+        excluded.setdefault(did, []).append(n)
+    return [_doc_json(d, excluded.get(d.id, [])) for d in docs]
 
 
 @router.get("/documents/{did}/file")

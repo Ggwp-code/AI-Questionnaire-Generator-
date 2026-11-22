@@ -17,15 +17,22 @@ from tribunal.ingestion.pdf import read_pdf, read_toc
 from tribunal.jobs.queue import ClaimedJob, owned_transaction
 from tribunal.runtime_config import ConfigSnapshot, RuntimeConfig, canonical_hash
 
-FLAG_RULES = 1  # bump when page_flags changes, so documents are extracted again
-_FORMULA = re.compile(r"[=≠≈≤≥±×÷√∑∏∫∂∇∞^²³¹⁰-₟]")
+FLAG_RULES = 2  # bump when page_flags changes, so documents are extracted again
+_FORMULA = re.compile(
+    r"[=<>\u2212≠≈≤≥±×÷√∑∏∫∂∇∞^²³¹⁰-₟]"
+    r"|\w[)\]]? [+/] [\w(]"  # spaced plus or slash between operands
+    r"|\w\*\w"
+    r"|(?<![\w-])[A-Za-z0-9] - [A-Za-z0-9](?![\w-])")  # spaced hyphen only between single-character operands
+_GREEK = re.compile("[\u0391-\u03a9\u03b1-\u03c9]")
+_GREEK_LANGUAGES = {"ell", "grc"}  # in these books Greek letters are ordinary text
 _CELL_GAP = re.compile(r" {2,}|\t|\|")
 
 
-def page_flags(text: str) -> set[str]:
+def page_flags(text: str, languages: list[str] | tuple = ()) -> set[str]:
     """Kinds of content whose OCR is unreliable enough to keep out of evidence."""
     # shortcut: symbol and column-gap heuristics, replace with layout-parser regions when one is configured
-    flags = {"formula"} if _FORMULA.search(text) else set()
+    greek = _GREEK.search(text) and not _GREEK_LANGUAGES & set(languages)
+    flags = {"formula"} if _FORMULA.search(text) or greek else set()
     rows = sum(len([c for c in _CELL_GAP.split(line) if c.strip()]) >= 3 for line in text.splitlines())
     return flags | {"table"} if rows >= 3 else flags
 
@@ -100,9 +107,7 @@ def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, 
 
     flagged_on = {"formula": set(ing.flag_formulas_on), "table": set(ing.flag_tables_on)}
     excluded = sorted(n for n in texts if ing.flagged_page_policy == "exclude" and any(
-        flagged_on[kind] & set(methods[n].split("+")) for kind in page_flags(texts[n])))
-    notice = (f"pages kept out of evidence because their text has a formula or table: "
-              f"{', '.join(map(str, excluded))}") if excluded else None
+        flagged_on[kind] & set(methods[n].split("+")) for kind in page_flags(texts[n], languages)))
 
     embedder = ctx.embedder(snapshot)
     evidence = {n: t for n, t in texts.items() if n not in excluded}
@@ -115,7 +120,7 @@ def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, 
         session.execute(delete(Page).where(Page.document_id == document_id))
         for n in sorted(texts):
             session.add(Page(document_id=document_id, page_number=n, method=methods[n],
-                             char_count=len(texts[n]), text=texts[n]))
+                             char_count=len(texts[n]), text=texts[n], excluded=n in excluded))
         built = session.scalar(select(Passage.id).where(Passage.document_id == document_id,
                                                         Passage.extraction_version == xv).limit(1))
         if built is None:  # otherwise an earlier run built this version: reuse it, never duplicate it
@@ -139,4 +144,4 @@ def _ingest(ctx, snapshot, document_id, storage_key, languages, subject_id, xv, 
             topic.retired_at = topic.retired_at or utcnow()
         doc = session.get(Document, document_id)
         doc.page_count, doc.extraction_version = len(infos), xv
-        doc.status, doc.ready_at, doc.error = "ready", utcnow(), notice
+        doc.status, doc.ready_at, doc.error = "ready", utcnow(), None

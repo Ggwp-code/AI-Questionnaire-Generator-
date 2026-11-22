@@ -52,9 +52,9 @@ The openai provider also needs OPENAI_API_KEY. Course content and model names ne
 
 With flagged_page_policy: exclude, a page whose text from a source listed in flag_formulas_on or
 flag_tables_on contains a formula or a table is stored but kept out of evidence, because a misread
-minus sign or exponent could support a wrong answer. The document stays ready and its error field
-lists the excluded pages. Changing these settings, or the outline settings, re-extracts the book
-on its next ingest; outline topics that the new outline no longer has are hidden and cannot be
+minus sign or exponent could support a wrong answer. The document stays ready and the documents
+list reports the excluded page numbers in its excluded_pages field. Changing these settings, or the outline
+settings, re-extracts the book on its next ingest; outline topics that the new outline no longer has are hidden and cannot be
 picked for new papers. Renaming an outline topic makes it a faculty topic, which rebuilds keep.
 
 Commands

@@ -278,3 +278,14 @@ def test_retired_outline_topic_hidden_and_refused(client, ctx):
     r = client.post("/api/papers", headers=h(A), json={
         "subject_id": sid, "template_id": tpl["id"], "topic_ids": [topics["1 Decision Trees"]], "title": "P"})
     assert r.status_code == 422 and r.json()["error"]["message"] == "unknown topic"
+
+
+def test_documents_list_reports_excluded_pages(client, ctx, fake_ocr):
+    from pdf_fixtures import scanned_pdf
+
+    fake_ocr.texts = {1: "plain prose " * 20, 2: "H = -\u03a3 p log p\n" + "entropy measures impurity " * 10}
+    sid = mk_subject(client)
+    upload(client, sid, scanned_pdf(2))
+    jobs(ctx)
+    [d] = client.get(f"/api/subjects/{sid}/documents", headers=h(A)).json()
+    assert d["status"] == "ready" and d["error"] is None and d["excluded_pages"] == [2]
