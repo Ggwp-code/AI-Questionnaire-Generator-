@@ -20,4 +20,10 @@ describe('route', () => {
       expect(parseHash(h)).toEqual({ view: 'subjects' });
     }
   });
+  it('does not throw on malformed or incomplete hashes', () => {
+    for (const h of ['#/subjects/%/library', '#/papers/%E0%A4%A', '#/subjects/', '#/papers/']) {
+      expect(parseHash(h)).toEqual({ view: 'subjects' });
+    }
+    expect(() => parseHash('#/subjects/s1/library/x')).not.toThrow();
+  });
 });

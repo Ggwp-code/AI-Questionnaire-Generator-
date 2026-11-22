@@ -41,4 +41,24 @@ describe('App', () => {
     expect(await screen.findByRole('button', { name: 'Sign in' })).toBeTruthy();
     expect(screen.getByLabelText('Email')).toBeTruthy();
   });
+  it('ignores a stored dev user in a non-dev build and sends no X-Dev-User', async () => {
+    vi.stubEnv('VITE_AUTH_MODE', 'prod');
+    const actual = await vi.importActual<typeof import('./services/tribunalApi')>('./services/tribunalApi');
+    vi.mocked(getDevUser).mockImplementation(actual.getDevUser);
+    vi.mocked(me).mockImplementation(actual.me);
+    vi.mocked(listSubjects).mockImplementation(actual.listSubjects);
+    localStorage.setItem('tribunal.devUser', 'stored@x.y');
+    const fetchMock = vi.fn(async (url: string) =>
+      new Response(JSON.stringify(url.endsWith('/me') ? { id: 'u1', email: 'me@x.y', is_admin: false } : []), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    await screen.findByText('me@x.y');
+    expect(screen.queryByRole('button', { name: 'Sign in' })).toBeNull();
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    for (const call of fetchMock.mock.calls) {
+      expect(new Headers((call[1] as RequestInit).headers).has('X-Dev-User')).toBe(false);
+    }
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  });
 });

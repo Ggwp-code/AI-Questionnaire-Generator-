@@ -8,12 +8,19 @@ export type Route =
 
 const TABS: Tab[] = ['library', 'topics', 'papers'];
 
+function decode(part: string): string | null {
+  try {
+    return decodeURIComponent(part);
+  } catch {
+    return null;
+  }
+}
+
 export function parseHash(hash: string): Route {
   const [root, id, tab] = hash.replace(/^#\/?/, '').split('/');
-  if (root === 'subjects' && id && TABS.includes(tab as Tab)) {
-    return { view: 'subject', sid: decodeURIComponent(id), tab: tab as Tab };
-  }
-  if (root === 'papers' && id) return { view: 'paper', pid: decodeURIComponent(id) };
+  const key = id ? decode(id) : null;
+  if (key && root === 'subjects' && TABS.includes(tab as Tab)) return { view: 'subject', sid: key, tab: tab as Tab };
+  if (key && root === 'papers') return { view: 'paper', pid: key };
   return { view: 'subjects' };
 }
 
