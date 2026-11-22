@@ -6,6 +6,7 @@ import json
 import re
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -14,9 +15,10 @@ from pdf_fixtures import FakeOcrEngine, digital_pdf, scanned_pdf
 from tribunal.api.app import create_app
 from tribunal.cli import main
 from tribunal.context import build_context
-from tribunal.db.models import Page
+from tribunal.db.models import Job, Page, Paper, Passage
 from tribunal.generation.providers.base import ProviderResult
 from tribunal.generation.providers.stub import StubProvider
+from tribunal.jobs.queue import enqueue
 from tribunal.jobs.worker import run_once
 from tribunal.settings import load_settings, reset_settings_cache
 from tribunal.textpolicy import TextPolicy
@@ -73,12 +75,13 @@ def topics(client, sid, who):
     return client.get(f"/api/subjects/{sid}/topics", headers=h(who)).json()
 
 
-def make_paper(client, ctx, sid, who, topic_ids, marks_each=2):
+def make_paper(client, ctx, sid, who, topic_ids, marks_each=2, queue_wait=0.0):
     tpl = client.post("/api/templates", json={"name": "t", "spec": spec(marks_each)}, headers=h(who))
     assert tpl.status_code == 201
     r = client.post("/api/papers", headers=h(who), json={
         "subject_id": sid, "template_id": tpl.json()["id"], "topic_ids": topic_ids, "title": "P"})
     assert r.status_code == 202
+    time.sleep(queue_wait)
     drain(ctx)
     return r.json()["paper_id"]
 
@@ -110,11 +113,8 @@ def test_first_ticket(test_env, settings, fake_ocr, ctx):
     assert [t["title"] for t in tb] == ["1 The French Revolution", "2 The Industrial Revolution"]
     assert {t["source"] for t in tb} == {"heading"}
 
-    # faculty B asks about a topic the history book does not cover
-    trees = client.post(f"/api/subjects/{sb}/topics", json={"title": "Trees"}, headers=h(B)).json()
-    pa = make_paper(client, ctx, sa, A, [t["id"] for t in ta])
-    pb = make_paper(client, ctx, sb, B, [tb[0]["id"], tb[1]["id"]])
-    pg = make_paper(client, ctx, sb, B, [tb[0]["id"], trees["id"]])
+    pa = make_paper(client, ctx, sa, A, [t["id"] for t in ta], queue_wait=0.2)
+    pb = make_paper(client, ctx, sb, B, [tb[0]["id"], tb[1]["id"]], queue_wait=0.2)
 
     paper_a, paper_b = get_paper(client, pa, A), get_paper(client, pb, B)
     for paper, who, doc in ((paper_a, A, doc_a), (paper_b, B, doc_b)):
@@ -132,10 +132,16 @@ def test_first_ticket(test_env, settings, fake_ocr, ctx):
                 assert passage["url"].endswith(f"#page={page.page_number}")
                 assert c["url"] == passage["url"]
 
-    gap = get_paper(client, pg, B)
-    by_topic = {s["topic_title"]: s["status"] for s in gap["slots"]}
-    assert by_topic["Trees"] == "evidence_gap"
-    assert by_topic["1 The French Revolution"] == "drafted"
+    # Faculty B asks, in a separate paper, for a topic that only A's book covers.
+    trees = client.post(f"/api/subjects/{sb}/topics", json={"title": "Decision Trees"}, headers=h(B)).json()
+    gap = get_paper(client, make_paper(client, ctx, sb, B, [trees["id"]]), B)
+    for slot in gap["slots"]:
+        assert (slot["status"], slot["revision"], slot["citations"]) == ("evidence_gap", None, [])
+        assert "Decision Trees" in slot["status_detail"]
+    with ctx.session_factory() as s:
+        a_ids = {doc_a} | {p.id for p in s.query(Passage).filter_by(document_id=doc_a)}
+    gap_json = json.dumps(gap)
+    assert not [i for i in a_ids if i in gap_json]
 
     before = [s["revision"]["id"] for s in paper_a["slots"]]
     assert client.post(f"/api/papers/{pa}/slots/2/regenerate", headers=h(A)).status_code == 202
@@ -159,8 +165,58 @@ def test_first_ticket(test_env, settings, fake_ocr, ctx):
     ta_t = get_paper(client, pa, A)["timings"]
     tb_t = get_paper(client, pb, B)["timings"]
     for t in (ta_t, tb_t):
-        assert t["first_question_seconds"] is not None and t["total_seconds"] is not None
-    print(f"timings A={ta_t} B={tb_t}")
+        assert 0.2 <= t["first_question_seconds"] <= t["total_seconds"]  # queue wait is counted
+    searchable = {who: client.get(f"/api/subjects/{sid}/documents", headers=h(who)).json()[0]["searchable_seconds"]
+                  for sid, who in ((sa, A), (sb, B))}
+    assert None not in searchable.values()
+    print(f"timings A={ta_t} B={tb_t} searchable A={searchable[A]} B={searchable[B]}")
+
+
+def test_return_later(test_env, settings, ctx):
+    client = TestClient(create_app(ctx))
+    sid = new_subject(client, A, "Machine Learning")
+    doc = ingest(client, ctx, sid, A, digital_pdf(ML_PAGES, ML_BOOKMARKS))
+    pid = make_paper(client, ctx, sid, A, [t["id"] for t in topics(client, sid, A)])
+    approve_all(client, pid, A)
+
+    def kept(slot):
+        rev = slot["revision"]
+        return rev["id"], slot["citations"], slot["status"], rev["approved_by"], rev["approved_at"]
+
+    def key_citations():
+        key = client.get(f"/api/papers/{pid}/export?part=key&format=json", headers=h(A))
+        assert key.status_code == 200
+        return [c["passage_id"] for sec in key.json()["sections"] for q in sec["questions"] for c in q["citations"]]
+
+    before = get_paper(client, pid, A)["slots"]
+    key_citations()
+    with ctx.session_factory.begin() as s:  # the faculty member comes back the next day
+        paper = s.get(Paper, pid)
+        paper.created_at -= timedelta(days=1)
+        paper.started_at -= timedelta(days=1)
+
+    assert client.post(f"/api/papers/{pid}/slots/2/regenerate", headers=h(A)).status_code == 202
+    drain(ctx)
+    after = get_paper(client, pid, A)["slots"]
+    assert [kept(after[0]), kept(after[2])] == [kept(before[0]), kept(before[2])]
+    assert after[1]["revision"]["id"] != before[1]["revision"]["id"]
+    assert after[1]["status"] in ("drafted", "needs_review")
+    assert (after[1]["revision"]["approved_by"], after[1]["revision"]["approved_at"]) == (None, None)
+    blocked = client.get(f"/api/papers/{pid}/export?part=key&format=json", headers=h(A))
+    assert blocked.status_code == 409 and blocked.json()["error"]["code"] == "export_blocked"
+    assert "question 2 is not approved" in blocked.json()["error"]["details"]
+    assert client.post(f"/api/papers/{pid}/slots/2/approve", headers=h(A)).status_code == 200
+    cited = key_citations()
+
+    with ctx.session_factory.begin() as s:  # reprocess the identical book
+        job_id = enqueue(s, "ingest", doc, ctx.snapshot.snapshot_id).id
+    drain(ctx)
+    with ctx.session_factory() as s:
+        assert s.get(Job, job_id).status == "done"
+    assert [d["status"] for d in client.get(f"/api/subjects/{sid}/documents", headers=h(A)).json()] == ["ready"]
+    assert key_citations() == cited
+    for passage_id in cited:
+        assert client.get(f"/api/passages/{passage_id}", headers=h(A)).status_code == 200
 
 
 def test_new_subject_from_headings_only(test_env, settings, ctx):

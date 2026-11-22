@@ -30,8 +30,11 @@ class TitleIn(BaseModel, extra="forbid"):
 
 
 def _doc_json(d: Document) -> dict:
+    # Upload to searchable: from the accepted upload to the index becoming ready.
+    searchable = (d.ready_at - d.created_at).total_seconds() if d.ready_at else None
     return {"id": d.id, "filename": d.filename, "status": d.status, "error": d.error,
-            "page_count": d.page_count, "created_at": d.created_at}
+            "page_count": d.page_count, "created_at": d.created_at, "ready_at": d.ready_at,
+            "searchable_seconds": searchable}
 
 
 def _topic_json(t: Topic) -> dict:

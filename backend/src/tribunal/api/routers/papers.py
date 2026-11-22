@@ -150,6 +150,8 @@ def get_paper(pid: str, user: User = Depends(current_user), session: Session = D
             "subject_id": paper.subject_id, "template": {"id": tpl.id, "name": tpl.name, "version": tpl.version},
             "config_snapshot_id": paper.config_snapshot_id, "document_ids": paper.document_ids,
             "tokens_used": paper.tokens_used,
+            # Clocks start when the request was accepted, so queue wait counts. First question: the first
+            # slot drafted or needing review (after review). Total: every slot has a visible outcome.
             "timings": {"first_question_seconds": _seconds(paper.created_at, paper.first_question_at),
                         "total_seconds": _seconds(paper.created_at, paper.completed_at)},
             "slots": out}

@@ -46,6 +46,13 @@ policy. config/runtime.example.yaml is the template. Its values use TRIBUNAL_* v
   TRIBUNAL_WORKER_THREADS default 2
 The openai provider also needs OPENAI_API_KEY. Course content and model names never go in code.
 
+With flagged_page_policy: exclude, a page whose text from a source listed in flag_formulas_on or
+flag_tables_on contains a formula or a table is stored but kept out of evidence, because a misread
+minus sign or exponent could support a wrong answer. The document stays ready and its error field
+lists the excluded pages. Changing these settings, or the outline settings, re-extracts the book
+on its next ingest; outline topics that the new outline no longer has are hidden and cannot be
+picked for new papers. Renaming an outline topic makes it a faculty topic, which rebuilds keep.
+
 Commands
 --------
 
@@ -64,6 +71,37 @@ Tests
 
 tests/test_acceptance.py runs the whole first ticket through the HTTP API with an offline stub
 provider and a fake OCR engine.
+
+Timers
+------
+
+Paper clocks start when the server accepts the paper request (Paper.created_at), so time spent
+waiting in the queue counts.
+  first_question_seconds  ends when the first slot is drafted or needs review, after review
+  total_seconds           ends when every slot has a visible outcome: drafted, needs_review,
+                          evidence_gap or failed
+Upload to searchable is measured separately: the documents list reports ready_at and
+searchable_seconds (ready_at - created_at). ready_at moves forward when a book is re-indexed.
+
+Pilot acceptance
+----------------
+
+CI uses simulated OCR and the stub provider. For acceptance, run on a machine with OCRmyPDF and
+Tesseract and the deployed model:
+
+    TRIBUNAL_LIVE_SCAN_PDF=/path/to/scanned-chapter.pdf \
+    TRIBUNAL_LIVE_RUNTIME_CONFIG=/path/to/runtime.yaml \
+    TRIBUNAL_LIVE_REVIEW_SHEET=/path/to/review-sheet.md \
+    OPENAI_API_KEY=... pytest tests/test_live_acceptance.py -s
+
+The test skips and names whatever is missing. It uses a temporary database and store, uploads the
+scan, requires every page to be OCR text, generates and approves a three-question paper, and
+writes a Markdown review sheet (default: under the pytest tmp dir; the path is printed). The sheet
+lists each question, its answer and each cited page with the full cited passage. Because the
+database is temporary, the reviewer checks each citation against that page of the source scan and
+marks the sheet yes or no. A citation on the right page can still support a wrong answer, for
+example when OCR misreads a symbol. The sheet holds an unreleased paper and its answer key: send
+it only to the reviewer, through the channel used for exam material.
 
 Not in this build
 -----------------
