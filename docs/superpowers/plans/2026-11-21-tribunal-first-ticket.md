@@ -722,3 +722,38 @@ Source: reviewer feedback the user pasted on 2026-11-22 (keep the ticket as the 
 - [ ] **Step 6: Run** `tests/test_acceptance.py -s`, `tests/test_api.py`, `tests/test_live_acceptance.py` (expect a skip with a clear reason), then the full suite, ruff and the text scan.
 
 - [ ] **Step 7: Commit** `test(backend): tighten first-ticket acceptance`
+
+### Task 15: S3-compatible object storage
+
+Source: the user asked (2026-11-22) for the work that lets staging start. Hosted profiles require `STORAGE_BACKEND=s3` (container disk is temporary) and `make_store` refuses it, so staging and production cannot start. Cloudflare R2 speaks the S3 API, so one backend covers AWS S3 and R2.
+
+**Files:**
+- Modify: `backend/src/tribunal/storage/__init__.py`
+- Modify: `backend/src/tribunal/context.py` (the `store` field type only)
+- Modify: `backend/README.md`
+- Test: `backend/tests/test_storage.py`
+
+**Interfaces:**
+- Consumes: `Settings` fields `storage_backend`, `s3_endpoint_url`, `s3_region`, `s3_bucket_uploads`, `s3_access_key_id`, `s3_secret_access_key` (all exist; `load_settings` already requires the bucket and both keys when the backend is `s3`). The `s3` optional extra already declares `boto3>=1.34`; use no other new dependency, in tests either (use `botocore.stub.Stubber`).
+- Callers of the store (unchanged): `documents.upload` (`put`), `documents.download` and `ingestion.pipeline._ingest` (`get`). Only uploaded PDFs are stored; exports are rendered on request.
+- Produces:
+  - Key validation shared by both stores: a key that is absolute or contains `..` raises `ValueError(f"invalid storage key: {key!r}")` before any I/O.
+  - `S3Store(client, bucket: str)` with `put(key: str, data: bytes) -> None` (`client.put_object(Bucket=bucket, Key=key, Body=data)`) and `get(key: str) -> bytes` (`client.get_object(Bucket=bucket, Key=key)["Body"].read()`).
+  - `make_store(settings) -> LocalStore | S3Store`: `s3` imports boto3 lazily; when it is missing, raise `ConfigurationError(["STORAGE_BACKEND 's3' needs boto3: install the s3 extra (pip install -e \"backend[s3]\")"])`. Otherwise build `boto3.client("s3", endpoint_url=settings.s3_endpoint_url, region_name=settings.s3_region, aws_access_key_id=<secret value>, aws_secret_access_key=<secret value>)` and return `S3Store(client, settings.s3_bucket_uploads)`. No network call at construction. `local` is unchanged.
+  - `AppContext.store` annotated `LocalStore | S3Store`.
+
+- [ ] **Step 1: Write the failing tests** (replace `test_make_store_s3_not_available`)
+
+```python
+def test_s3_store_roundtrip(): real boto3 client (region "us-east-1", dummy keys) wrapped in Stubber; expect put_object {"Bucket": "uploads", "Key": "documents/s/d.pdf", "Body": b"%PDF-1"} then get_object {"Bucket": "uploads", "Key": "documents/s/d.pdf"} returning a StreamingBody of b"%PDF-1"; assert get returns the bytes and stubber.assert_no_pending_responses()
+@pytest.mark.parametrize("key", ["../x", "/etc/passwd", "a/../../x"])
+def test_s3_store_rejects_escape(key): put and get raise ValueError; the stubbed client receives no call
+def test_make_store_s3_from_settings(settings): settings with storage_backend "s3", endpoint "https://acct.r2.cloudflarestorage.com", region "auto", bucket uploads "uploads", dummy keys -> S3Store whose bucket is "uploads" and whose client.meta.endpoint_url and client.meta.region_name match
+def test_make_store_s3_without_boto3(settings, monkeypatch): monkeypatch.setitem(sys.modules, "boto3", None) -> ConfigurationError mentioning "install the s3 extra"
+```
+
+- [ ] **Step 2: Run them and confirm they fail** for the expected reason.
+- [ ] **Step 3: Implement** `storage/__init__.py` and the `context.py` annotation.
+- [ ] **Step 4: README**: STORAGE_BACKEND is `local` or `s3`; add `S3_ENDPOINT_URL` (set for R2 or another S3-compatible service; omit for AWS), `S3_REGION` (`auto` for R2), `S3_BUCKET_UPLOADS`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and the `s3` extra; say `S3_BUCKET_EXPORTS` is validated but not used yet because exports are rendered on request; remove "S3 storage" from "Not in this build" and replace the sentence saying staging and production cannot start with what they still need (Postgres with pgvector, an OIDC provider, the s3 extra).
+- [ ] **Step 5: Run** `tests/test_storage.py`, the full suite, ruff and the text scan.
+- [ ] **Step 6: Commit** `feat(backend): S3-compatible object storage`
