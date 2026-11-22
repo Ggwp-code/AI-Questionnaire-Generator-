@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from tribunal.api.routers import documents, papers, subjects
+from tribunal.api.routers import documents, internal, papers, subjects
 from tribunal.context import AppContext
 from tribunal.errors import TribunalError
 
@@ -32,4 +32,6 @@ def create_app(ctx: AppContext) -> FastAPI:
 
     for module in (subjects, documents, papers):
         app.include_router(module.router)
+    if ctx.settings.internal_dispatch_token is not None:
+        app.include_router(internal.router)
     return app

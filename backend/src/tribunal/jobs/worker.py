@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 
 from sqlalchemy import select
@@ -94,9 +95,9 @@ def _lease_kept(ctx: AppContext, job: ClaimedJob, lease_seconds: float) -> Itera
         thread.join()
 
 
-def run_once(ctx: AppContext) -> bool:
+def run_once(ctx: AppContext, kinds: Sequence[str] | None = None) -> bool:
     retries = ctx.snapshot.config.retries
-    job = claim_next(ctx.session_factory, retries.lease_seconds)
+    job = claim_next(ctx.session_factory, retries.lease_seconds, kinds=kinds)
     if job is None:
         return False
     try:
@@ -128,6 +129,15 @@ def run_once(ctx: AppContext) -> bool:
         log.warning("job %s (%s) was reclaimed by another worker after its lease expired; result discarded",
                     job.id, job.kind)
     return True
+
+
+def run_until_idle(ctx: AppContext, kinds: Sequence[str] | None, max_seconds: float) -> int:
+    """Process claimable jobs until none is left or the time is up; returns how many were processed."""
+    deadline = time.monotonic() + max_seconds
+    processed = 0
+    while time.monotonic() < deadline and run_once(ctx, kinds):
+        processed += 1
+    return processed
 
 
 class _PermanentFailure(Exception):

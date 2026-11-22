@@ -298,3 +298,13 @@ def test_requeued_job_waits_out_its_retry_delay(ctx):
     assert claim_next(ctx.session_factory, 60) is None
     assert claim_next(ctx.session_factory, 60, now=utcnow() + timedelta(seconds=29)) is None
     assert claim_next(ctx.session_factory, 60, now=utcnow() + timedelta(seconds=31)).id == a
+
+
+def test_claim_respects_kinds(ctx):
+    with ctx.session_factory.begin() as s:
+        a = enqueue(s, "ingest", "a", ctx.snapshot.snapshot_id).id
+        b = enqueue(s, "generate_paper", "b", ctx.snapshot.snapshot_id).id
+    assert claim_next(ctx.session_factory, 60, kinds=["generate_paper"]).id == b
+    assert claim_next(ctx.session_factory, 60, kinds=["generate_paper"]) is None
+    assert claim_next(ctx.session_factory, 60, kinds=[]) is None
+    assert claim_next(ctx.session_factory, 60).id == a

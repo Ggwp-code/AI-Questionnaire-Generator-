@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -30,12 +30,15 @@ def enqueue(session: Session, kind: str, target_id: str, snapshot_id: str) -> Jo
     return job
 
 
-def claim_next(factory: sessionmaker[Session], lease_seconds: int, now: datetime | None = None) -> ClaimedJob | None:
+def claim_next(factory: sessionmaker[Session], lease_seconds: int, now: datetime | None = None,
+               kinds: Sequence[str] | None = None) -> ClaimedJob | None:
     now = now or utcnow()
     with factory.begin() as session:
         # a requeued job waits out its retry delay, which is kept in lease_until
         ready = or_(Job.lease_until.is_(None), Job.lease_until <= now)
         eligible = or_((Job.status == "queued") & ready, (Job.status == "running") & (Job.lease_until < now))
+        if kinds is not None:
+            eligible = eligible & Job.kind.in_(kinds)
         candidate = (select(Job.id).where(eligible).order_by(Job.created_at, Job.id)
                      .limit(1).with_for_update(skip_locked=True).scalar_subquery())
         job = session.scalar(update(Job).where(Job.id == candidate, eligible)
