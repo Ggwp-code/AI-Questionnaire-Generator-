@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ApiError, addMember } from '../../services/tribunalApi';
 import { formatHash, type Tab } from './route';
 import ErrorNotice from './ErrorNotice';
+import LibraryPage from './LibraryPage';
 
 const TABS: [Tab, string][] = [['library', 'Library'], ['topics', 'Topics'], ['papers', 'Papers']];
 
@@ -36,8 +37,7 @@ export default function SubjectPage({ sid, tab }: { sid: string; tab: Tab }) {
           </a>
         ))}
       </nav>
-      {/* Tasks 4, 5 and 6 replace this placeholder with the real pages */}
-      <p className="text-ink/60">The {tab} page is not available yet.</p>
+      {tab === 'library' ? <LibraryPage sid={sid} /> : <p className="text-ink/60">The {tab} page is not available yet.</p>}
       <form onSubmit={add} className="flex flex-wrap items-end gap-3">
         <label className="text-sm text-ink">
           Colleague email
