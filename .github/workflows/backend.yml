@@ -2,9 +2,9 @@ name: backend
 
 on:
   push:
-    paths: ["backend/**", "docs/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "docs/**", "frontend/**", ".github/workflows/backend.yml"]
   pull_request:
-    paths: ["backend/**", "docs/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "docs/**", "frontend/**", ".github/workflows/backend.yml"]
 
 jobs:
   test:
@@ -17,4 +17,18 @@ jobs:
       - run: pip install -e "backend[dev,openai,s3]"
       - run: ruff check backend
       - run: cd backend && pytest
-      - run: tribunal scan-text --config backend/config/runtime.example.yaml backend docs
+      - run: tribunal scan-text --config backend/config/runtime.example.yaml backend docs frontend/components/faculty frontend/services
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

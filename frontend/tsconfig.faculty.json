@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["vite-env.d.ts", "services/tribunal*.ts", "components/faculty/**/*"]
+}
